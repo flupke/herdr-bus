@@ -3,10 +3,9 @@
 ## Goal
 
 Let Herdr mods and their native backends exchange messages through
-configurable connections. A Slack/X/email reader marks messages with its
-own triggers and publishes them on an output; Bowtie reads an input and
-turns what arrives into tasks. Sentry, Honeycomb and others plug in the
-same way later. Connections are made and inspected in one small mod.
+configurable connections. A producer publishes messages on its outputs;
+a consumer reads its inputs; which output feeds which input is decided
+outside both, in one small mod where connections are made and inspected.
 
 Two pieces:
 
@@ -20,8 +19,8 @@ No daemon. Every producer and consumer opens the database itself.
 ## Model
 
 - **Endpoint**: a named output (source) or input (sink), owned by one
-  program. Address: `<owner>:<name>`, for example `slack:flagged`,
-  `sentry:new-issues`, `bowtie:inbox`.
+  program. Address: `<owner>:<name>`, for example `producer:events` or
+  `consumer:inbox`.
 - **Message**: an immutable entry appended to an output. Messages are
   stored once, whoever reads them.
 - **Connection**: output → input. It holds a cursor: the last message
@@ -47,8 +46,8 @@ idempotent on the message `id`.
 
 ```sql
 CREATE TABLE endpoints (
-  address     TEXT PRIMARY KEY,          -- "slack:flagged"
-  owner       TEXT NOT NULL,             -- "slack"
+  address     TEXT PRIMARY KEY,          -- "producer:events"
+  owner       TEXT NOT NULL,             -- "producer"
   kind        TEXT NOT NULL CHECK (kind IN ('out', 'in')),
   description TEXT NOT NULL DEFAULT '',
   types       TEXT NOT NULL DEFAULT '[]', -- JSON array of message types it emits/accepts
@@ -60,7 +59,7 @@ CREATE TABLE messages (
   seq       INTEGER PRIMARY KEY AUTOINCREMENT,
   endpoint  TEXT NOT NULL REFERENCES endpoints(address),
   id        TEXT NOT NULL,               -- producer-chosen, stable across retries
-  type      TEXT NOT NULL,               -- "slack.message.flagged"
+  type      TEXT NOT NULL,               -- "producer.thing.happened"
   subject   TEXT,                        -- short human line for listings
   time      TEXT NOT NULL,               -- when the event happened
   published TEXT NOT NULL,               -- when it was appended
@@ -100,12 +99,12 @@ CloudEvents-shaped, as stored in `messages`:
 
 ```json
 {
-  "id": "slack:C0123:1730367000.1234",
-  "type": "slack.message.flagged",
-  "subject": "#incidents: checkout 500s since deploy",
+  "id": "producer:4f1c9e",
+  "type": "producer.thing.happened",
+  "subject": "One line for listings",
   "time": "2026-10-31T09:30:00Z",
-  "data": { "channel": "incidents", "author": "…", "text": "…", "permalink": "…" },
-  "links": [{ "label": "Slack", "url": "https://…" }]
+  "data": { "any": "JSON the type defines" },
+  "links": [{ "label": "Source", "url": "https://…" }]
 }
 ```
 
@@ -120,18 +119,18 @@ let bus = Bus::open_default()?;                    // or Bus::open(path)
 
 // Every program registers its endpoints at startup. Idempotent; updates
 // description, types and last_seen.
-bus.register(Endpoint::output("slack:flagged").describe("Messages matching my triggers")
-    .types(["slack.message.flagged"]))?;
-bus.register(Endpoint::input("bowtie:inbox").types(["*"]))?;
+bus.register(Endpoint::output("producer:events").describe("What this output carries")
+    .types(["producer.thing.happened"]))?;
+bus.register(Endpoint::input("consumer:inbox").types(["*"]))?;
 
 // Producer. Returns the seq, or the existing seq if (endpoint, id) is already there.
-bus.publish("slack:flagged", Message::new(id, "slack.message.flagged", data).subject(s))?;
+bus.publish("producer:events", Message::new(id, "producer.thing.happened", data).subject(s))?;
 
 // Consumer: the next messages for every enabled connection into this input,
 // after each connection's cursor, plus failures marked for retry.
 // Order: connections by id (creation order), then seq within each one.
 // No fairness or priority between connections.
-for d in bus.pull("bowtie:inbox", 50)? {
+for d in bus.pull("consumer:inbox", 50)? {
     match handle(&d.message) {
         Ok(()) => bus.ack(d.connection, d.seq)?,
         Err(e) => bus.fail(d.connection, d.seq, &e.to_string())?,
@@ -139,7 +138,7 @@ for d in bus.pull("bowtie:inbox", 50)? {
 }
 
 // Wiring (used by the CLI and therefore herdr-patch).
-bus.connect("slack:flagged", "bowtie:inbox", Start::Now)?;   // or Start::Beginning
+bus.connect("producer:events", "consumer:inbox", Start::Now)?;   // or Start::Beginning
 bus.disconnect(connection_id)?;
 bus.set_enabled(connection_id, false)?;
 bus.retry(failure_id)?;   // state = retry: pull returns it again
@@ -178,8 +177,8 @@ herdr-bus failures [--connection …] [--state failed|retry|dropped]
 herdr-bus retry|drop <failure>
 ```
 
-The CLI is the way in for non-Rust programs (the Python digest
-collector, shell scripts) and for herdr-patch, since a mod can't link a
+The CLI is the way in for non-Rust programs (other languages, shell
+scripts) and for herdr-patch, since a mod can't link a
 Rust library.
 
 ## Retention
@@ -214,8 +213,7 @@ Later, not v1: a canvas with draggable nodes and wires (`paint_path`).
 
 ## Out of scope for v1
 
-- Filters on connections (producers' own triggers decide what goes on an
-  output).
+- Filters on connections (producers decide what goes on an output).
 - Remote machines (one local SQLite file).
 - Waking consumers. Consumers poll `pull`; herdr-patch watches the file.
 - Access control between programs.
@@ -228,27 +226,9 @@ Public repo `github.com/flupke/herdr-bus`, a Cargo workspace:
 
 ```
 crates/herdr-bus/        library + `herdr-bus` CLI
-examples/sentry-poller/  first producer, the reference integration
 mods/herdr-patch/        the mod, installed into ~/.config/herdr-app/mods/
 SPEC.md                  this file
 ```
 
-herdr-bus is meant to be plugged into other mods' backends (the digest
-collector, Bowtie, Honeycomb, …); those live in their own repos and
-depend on the crate or call the CLI.
-
-## First producer: sentry-poller
-
-The example every later integration copies.
-
-- Registers `sentry:new-issues` (out) at startup.
-- Polls Sentry's REST API for issues first seen since its last run, per
-  configured org/project, with a token from the environment
-  (`SENTRY_AUTH_TOKEN`, loaded from `~/.secrets` like the digest).
-- Publishes each as `sentry.issue.new`, `id` = `sentry:<issue id>`, so
-  re-polling the same window is harmless (`UNIQUE (endpoint, id)`).
-  `subject` is the issue title, `links` the issue URL, `data` the fields
-  a fixer needs (project, culprit, level, first/last seen, count,
-  permalink).
-- Its own state (last poll time) lives in its own file, not in the bus.
-- Runs once per invocation; scheduling is a systemd user timer.
+herdr-bus is meant to be plugged into other mods' backends; those live
+in their own repos and depend on the crate or call the CLI.
