@@ -63,7 +63,7 @@ CREATE TABLE endpoints (
 CREATE TABLE messages (
   seq       INTEGER PRIMARY KEY AUTOINCREMENT,
   endpoint  TEXT NOT NULL REFERENCES endpoints(address),
-  id        TEXT NOT NULL,               -- producer-chosen, stable across retries
+  id        TEXT NOT NULL,               -- UUID: the producer's, stable across retries, or generated
   type      TEXT NOT NULL,               -- "producer.thing.happened"
   subject   TEXT,                        -- short human line for listings
   time      TEXT NOT NULL,               -- when the event happened
@@ -93,7 +93,7 @@ CloudEvents-shaped, as stored in `messages`:
 
 ```json
 {
-  "id": "producer:4f1c9e",
+  "id": "0196f1c2-7a3e-7c41-9b2d-5e8f0a1b2c3d",
   "type": "producer.thing.happened",
   "subject": "One line for listings",
   "time": "2026-10-31T09:30:00Z",
@@ -118,7 +118,8 @@ bus.register(Endpoint::output("producer:events").describe("What this output carr
 bus.register(Endpoint::input("consumer:inbox").types(["*"]))?;
 
 // Producer. Returns the seq, or the existing seq if (endpoint, id) is already there.
-bus.publish("producer:events", Message::new(id, "producer.thing.happened", data).subject(s))?;
+// The id is optional: without one, the bus generates a UUIDv7.
+bus.publish("producer:events", Message::new("producer.thing.happened", data).id(uuid).subject(s))?;
 
 // Consumer: the next messages for every enabled connection into this input,
 // after each connection's cursor.
@@ -142,6 +143,11 @@ Rules:
 - `pull` never moves cursors by itself.
 - `connect` on a connection that exists is a no-op: it keeps its cursor and
   `enabled`, ignores `Start`, and returns its id.
+- A message `id` is a UUID, of any version; `publish` refuses anything else.
+  It is optional: without one, the bus generates a UUIDv7. A producer that
+  may retry a publish (a crash, a timeout) generates the id itself before
+  the first attempt and reuses it; one with an ID of its own that is not a
+  UUID derives one from it with UUIDv5.
 - `publish` of an `(endpoint, id)` already there succeeds and returns the
   existing seq; the CLI exits 0.
 - Writes run in short `BEGIN IMMEDIATE` transactions.
@@ -155,7 +161,7 @@ output, one JSON document on stdout) and `--db <path>`. Errors: exit 1,
 ```
 herdr-bus endpoints                          # registry, with lag per connection
 herdr-bus register <address> --kind out|in [--description …] [--types a,b]
-herdr-bus publish <output> --id … --type … [--subject …] [--time …] [--data JSON | stdin]
+herdr-bus publish <output> [--id UUID] --type … [--subject …] [--time …] [--data JSON | stdin]
 herdr-bus pull <input> [--limit N]
 herdr-bus ack <connection> <seq>
 herdr-bus connections
@@ -170,7 +176,7 @@ herdr-bus message <seq>
 `{"connection": 3, "seq": 43, "message": {<envelope>}}`, the envelope as in
 Message envelope (`id`, `type`, `subject`, `time`, `data`, `links`); `[]`
 when there is nothing.
-`publish --json` prints `{"seq": 43}`.
+`publish --json` prints `{"seq": 43, "id": "<uuid>"}`, the id given or generated.
 
 The CLI is the way in for non-Rust programs (other languages, shell
 scripts) and for herdr-patch, since a mod can't link a
