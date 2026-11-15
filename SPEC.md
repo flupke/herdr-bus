@@ -12,7 +12,7 @@ Two pieces:
 - **herdr-bus**: a Rust crate (library + CLI) storing messages in one
   SQLite file, used as an append-only log with one cursor per connection.
 - **herdr-patch**: a herdr-app mod that lists registered endpoints,
-  connects them, and shows messages, cursors and failures.
+  connects them, and shows messages and cursors.
 
 No daemon. Every producer and consumer opens the database itself.
 
@@ -27,8 +27,6 @@ No daemon. Every producer and consumer opens the database itself.
   `seq` the consumer has handled on this connection. Several connections
   can read the same output independently; one input can have several
   connections feeding it.
-- **Failure**: a message a consumer read but could not handle. Recorded,
-  the cursor moves on, so one bad message never blocks a connection.
 
 Producers don't know their consumers. Connecting later and replaying
 history works because messages are kept.
@@ -37,12 +35,19 @@ Delivery is at-least-once: a consumer that crashes after handling a
 message but before acknowledging it sees it again. Consumers are
 idempotent on the message `id`.
 
+The bus has two consumer operations, `pull` and `ack`, and no failure
+handling. A message the consumer doesn't ack comes back on its next
+`pull`. A consumer that can't handle a message decides what to do with it:
+ack it to skip it, or leave it unacked to stop there.
+
 ## Storage
 
 - One file: `$XDG_DATA_HOME/herdr-bus/bus.db` (default
   `~/.local/share/herdr-bus/bus.db`), overridable with `HERDR_BUS_DB`.
 - `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`.
-- Schema version in `PRAGMA user_version`; the crate migrates on open.
+- Schema version in `PRAGMA user_version`; the crate migrates on open. A
+  file whose version is newer than the crate knows is refused with a clear
+  error, before any write (another program's newer build opened it first).
 
 ```sql
 CREATE TABLE endpoints (
@@ -76,17 +81,6 @@ CREATE TABLE connections (
   cursor   INTEGER NOT NULL,             -- last handled messages.seq
   created  TEXT NOT NULL,
   UNIQUE (source, target)
-);
-
-CREATE TABLE failures (
-  id         INTEGER PRIMARY KEY,
-  connection INTEGER NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
-  seq        INTEGER NOT NULL REFERENCES messages(seq),
-  error      TEXT NOT NULL,
-  attempts   INTEGER NOT NULL DEFAULT 1,
-  state      TEXT NOT NULL CHECK (state IN ('failed', 'retry', 'dropped')),
-  at         TEXT NOT NULL,
-  UNIQUE (connection, seq)
 );
 ```
 
@@ -127,31 +121,29 @@ bus.register(Endpoint::input("consumer:inbox").types(["*"]))?;
 bus.publish("producer:events", Message::new(id, "producer.thing.happened", data).subject(s))?;
 
 // Consumer: the next messages for every enabled connection into this input,
-// after each connection's cursor, plus failures marked for retry.
+// after each connection's cursor.
 // Order: connections by id (creation order), then seq within each one.
 // No fairness or priority between connections.
 for d in bus.pull("consumer:inbox", 50)? {
-    match handle(&d.message) {
-        Ok(()) => bus.ack(d.connection, d.seq)?,
-        Err(e) => bus.fail(d.connection, d.seq, &e.to_string())?,
-    }
+    handle(&d.message)?;              // on error, stop: the next pull returns it again
+    bus.ack(d.connection, d.seq)?;
 }
 
 // Wiring (used by the CLI and therefore herdr-patch).
 bus.connect("producer:events", "consumer:inbox", Start::Now)?;   // or Start::Beginning
 bus.disconnect(connection_id)?;
 bus.set_enabled(connection_id, false)?;
-bus.retry(failure_id)?;   // state = retry: pull returns it again
-bus.drop_failure(failure_id)?;
 ```
 
 Rules:
 
 - `ack(connection, seq)` moves the cursor to `seq` if it is higher; acks
-  are idempotent. Acking a retried failure deletes the failure row.
-- `fail` records or updates the failure (`attempts += 1`) and moves the
-  cursor like `ack`.
+  are idempotent.
 - `pull` never moves cursors by itself.
+- `connect` on a connection that exists is a no-op: it keeps its cursor and
+  `enabled`, ignores `Start`, and returns its id.
+- `publish` of an `(endpoint, id)` already there succeeds and returns the
+  existing seq; the CLI exits 0.
 - Writes run in short `BEGIN IMMEDIATE` transactions.
 
 ## CLI
@@ -166,16 +158,19 @@ herdr-bus register <address> --kind out|in [--description …] [--types a,b]
 herdr-bus publish <output> --id … --type … [--subject …] [--time …] [--data JSON | stdin]
 herdr-bus pull <input> [--limit N]
 herdr-bus ack <connection> <seq>
-herdr-bus fail <connection> <seq> --error …
 herdr-bus connections
 herdr-bus connect <source> <target> [--from now|beginning]
 herdr-bus disconnect <connection>
 herdr-bus enable|disable <connection>
 herdr-bus messages [--endpoint …] [--connection …] [--before SEQ] [--limit N]
 herdr-bus message <seq>
-herdr-bus failures [--connection …] [--state failed|retry|dropped]
-herdr-bus retry|drop <failure>
 ```
+
+`pull --json` prints an array, in `pull`'s order, of
+`{"connection": 3, "seq": 43, "message": {<envelope>}}`, the envelope as in
+Message envelope (`id`, `type`, `subject`, `time`, `data`, `links`); `[]`
+when there is nothing.
+`publish --json` prints `{"seq": 43}`.
 
 The CLI is the way in for non-Rust programs (other languages, shell
 scripts) and for herdr-patch, since a mod can't link a
@@ -183,10 +178,10 @@ Rust library.
 
 ## Retention
 
-History is kept forever in v1: nothing deletes messages, failures or
+History is kept forever in v1: nothing deletes messages or
 connections' past. Pruning is added later if the file grows enough to
 matter; when it is, a message must only go once every connection from its
-endpoint has a cursor past it and it has no open failure.
+endpoint has a cursor past it.
 
 ## herdr-patch (mod)
 
@@ -198,12 +193,12 @@ tab or pane (`tab.new {mod: "herdr-patch"}`).
   changes on every write), debounced; no fast polling.
 - **Wiring view (v1):** outputs in a left column, inputs in a right
   column, grouped by owner; connections listed between them with lag
-  (`latest seq − cursor`), failure count and an enabled switch. Connect:
+  (`latest seq − cursor`) and an enabled switch. Connect:
   pick an output, then an input, then "from now" or "from the beginning".
   Disconnect from a connection's menu.
 - **Inspection:** clicking an endpoint lists its messages (newest first,
   paged with `--before`); clicking a connection shows its messages with
-  the cursor marked, and its failures with Retry and Drop. A message opens
+  the cursor marked. A message opens
   as its envelope with `data` pretty-printed and its links clickable.
 - **Stale endpoints:** endpoints whose `last_seen` is old are dimmed, not
   hidden.
@@ -214,10 +209,15 @@ Later, not v1: a canvas with draggable nodes and wires (`paint_path`).
 ## Out of scope for v1
 
 - Filters on connections (producers decide what goes on an output).
-- Remote machines (one local SQLite file).
+- Remote machines in the bus (one local SQLite file). A program reads or
+  writes another machine's bus by running the CLI there, through
+  `hc exec --on <machine> herdr-bus …`.
 - Waking consumers. Consumers poll `pull`; herdr-patch watches the file.
 - Access control between programs.
 - Deleting history (no `prune`; see Retention).
+- Failure handling in the bus: no `fail`, `retry`, `drop`, dead-letter
+  list or delivery limit. A message that keeps crashing its consumer
+  blocks its connection, which shows as growing lag in herdr-patch.
 - Message schemas beyond the `types` list.
 
 ## Repository
