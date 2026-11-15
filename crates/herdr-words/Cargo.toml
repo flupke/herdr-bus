@@ -1,0 +1,16 @@
+[package]
+name = "herdr-words"
+description = "The herdr.words message type: words someone wrote to an actor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

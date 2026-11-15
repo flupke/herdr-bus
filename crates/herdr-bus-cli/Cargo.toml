@@ -1,0 +1,26 @@
+[package]
+name = "herdr-bus-cli"
+description = "The herdr-bus command: the bus for programs that cannot link it, and its sessions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "herdr-bus"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+herdr-bus.workspace = true
+herdr-bus-client.workspace = true
+jiff.workspace = true
+notify.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

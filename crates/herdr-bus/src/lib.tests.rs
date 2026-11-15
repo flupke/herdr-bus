@@ -1,0 +1,364 @@
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use serde_json::json;
+use tempfile::TempDir;
+
+use super::*;
+
+/// A private bus file, with an output `events` the consumer `inbox` of this machine reads.
+struct Fixture {
+    _dir: TempDir,
+    path: PathBuf,
+    bus: Bus,
+    connection: ConnectionId,
+}
+
+fn fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bus.db");
+    let bus = Bus::open(&path).unwrap();
+    bus.declare(&Output::new("events")).unwrap();
+    let connection = bus.connect("inbox", "events", Start::Now).unwrap();
+    Fixture {
+        _dir: dir,
+        path,
+        bus,
+        connection,
+    }
+}
+
+/// A message named `name` in its data, with an id the producer derives from the name.
+fn message(name: &str) -> Message {
+    Message::new("producer.thing.happened", json!({ "n": name }))
+        .id(Uuid::new_v5(&Uuid::NAMESPACE_OID, name.as_bytes()))
+}
+
+fn names(deliveries: &[Delivery]) -> Vec<&str> {
+    deliveries
+        .iter()
+        .map(|d| d.message.data["n"].as_str().unwrap())
+        .collect()
+}
+
+#[test]
+fn a_pulled_message_comes_back_until_acknowledged() {
+    let Fixture { bus, path, .. } = &fixture();
+    bus.publish("events", &message("a").subject("A")).unwrap();
+    bus.publish("events", &message("b")).unwrap();
+
+    let first = bus.pull("inbox", 50).unwrap();
+    assert_eq!(names(&first), ["a", "b"]);
+    assert_eq!(first[0].message.subject.as_deref(), Some("A"));
+    assert_eq!(first[0].message.data, json!({ "n": "a" }));
+    assert_eq!(names(&bus.pull("inbox", 50).unwrap()), ["a", "b"]);
+
+    // The consumer acknowledges the first, then crashes: another opens the file.
+    bus.ack(first[0].connection, first[0].seq).unwrap();
+    let reopened = Bus::open(path).unwrap();
+    assert_eq!(names(&reopened.pull("inbox", 50).unwrap()), ["b"]);
+
+    reopened.ack(first[1].connection, first[1].seq).unwrap();
+    // Acknowledging an earlier one again moves nothing back.
+    reopened.ack(first[0].connection, first[0].seq).unwrap();
+    assert!(reopened.pull("inbox", 50).unwrap().is_empty());
+}
+
+#[test]
+fn a_tap_reads_every_output_at_its_own_pace() {
+    let Fixture {
+        bus, connection, ..
+    } = &fixture();
+    let tap = bus.connect("hook", TAP, Start::Now).unwrap();
+    bus.declare(&Output::new("news")).unwrap();
+    bus.publish("events", &message("a")).unwrap();
+    bus.publish("news", &message("b")).unwrap();
+
+    // The inbox's connection reads its own output alone.
+    let inbox = bus.pull("inbox", 50).unwrap();
+    assert_eq!(names(&inbox), ["a"]);
+    bus.ack(*connection, inbox[0].seq).unwrap();
+
+    let tapped = bus.pull("hook", 50).unwrap();
+    assert_eq!(names(&tapped), ["a", "b"]);
+    assert!(tapped.iter().all(|d| d.connection == tap));
+    let outputs: Vec<_> = tapped.iter().map(|d| d.output.as_str()).collect();
+    assert_eq!(outputs, ["events", "news"]);
+    bus.ack(tap, tapped[0].seq).unwrap();
+    assert_eq!(names(&bus.pull("hook", 50).unwrap()), ["b"]);
+    assert_eq!(bus.connection(tap).unwrap().lag, 1);
+}
+
+#[test]
+fn a_connection_from_now_skips_what_its_output_already_holds() {
+    let Fixture { bus, .. } = &fixture();
+    bus.publish("events", &message("old")).unwrap();
+    bus.connect("late", "events", Start::Now).unwrap();
+    bus.connect("all", "events", Start::Beginning).unwrap();
+    bus.publish("events", &message("new")).unwrap();
+
+    assert_eq!(names(&bus.pull("late", 50).unwrap()), ["new"]);
+    assert_eq!(names(&bus.pull("all", 50).unwrap()), ["old", "new"]);
+}
+
+/// `serve` notifies a consumer from its positions: they must show a message to pull exactly
+/// where a pull returns one, or a session never wakes, or wakes for nothing again and again.
+#[test]
+fn positions_show_a_message_to_pull_exactly_where_a_pull_returns_one() {
+    let Fixture {
+        bus, connection, ..
+    } = &fixture();
+    let waiting = |consumer: &str| {
+        let positions = bus.positions(consumer).unwrap();
+        let shown = positions
+            .iter()
+            .any(|at| at.newest.is_some_and(|newest| newest > at.cursor));
+        assert_eq!(shown, !bus.pull(consumer, 50).unwrap().is_empty());
+        shown
+    };
+    bus.connect("hook", TAP, Start::Now).unwrap();
+    bus.declare(&Output::new("news")).unwrap();
+    assert_eq!((waiting("inbox"), waiting("hook")), (false, false));
+
+    // On another output: the tap has it to pull, the inbox does not.
+    bus.publish("news", &message("a")).unwrap();
+    assert_eq!((waiting("inbox"), waiting("hook")), (false, true));
+
+    bus.publish("events", &message("b")).unwrap();
+    assert!(waiting("inbox"));
+    // A disabled connection delivers nothing, and shows nothing to pull.
+    bus.set_enabled(*connection, false).unwrap();
+    assert!(!waiting("inbox"));
+}
+
+#[test]
+fn a_pull_reads_connections_in_order_up_to_its_limit() {
+    let Fixture { bus, .. } = &fixture();
+    bus.declare(&Output::new("other")).unwrap();
+    bus.publish("other", &message("old")).unwrap();
+    bus.connect("inbox", "other", Start::Beginning).unwrap();
+    bus.publish("other", &message("o1")).unwrap();
+    bus.publish("events", &message("p1")).unwrap();
+    bus.publish("events", &message("p2")).unwrap();
+
+    let all = bus.pull("inbox", 50).unwrap();
+    assert_eq!(names(&all), ["p1", "p2", "old", "o1"]);
+    assert_eq!(names(&bus.pull("inbox", 3).unwrap()), ["p1", "p2", "old"]);
+}
+
+#[test]
+fn connecting_again_keeps_the_connection_as_it_was() {
+    let Fixture {
+        bus, connection, ..
+    } = &fixture();
+    let seq = bus.publish("events", &message("a")).unwrap();
+    bus.publish("events", &message("b")).unwrap();
+    bus.ack(*connection, seq).unwrap();
+    bus.set_enabled(*connection, false).unwrap();
+
+    let again = bus.connect("inbox", "events", Start::Beginning).unwrap();
+    assert_eq!(again, *connection);
+    let kept = bus.connection(again).unwrap();
+    assert_eq!((kept.cursor, kept.enabled), (seq, false));
+    assert!(bus.pull("inbox", 50).unwrap().is_empty());
+
+    bus.set_enabled(*connection, true).unwrap();
+    assert_eq!(names(&bus.pull("inbox", 50).unwrap()), ["b"]);
+}
+
+#[test]
+fn publishing_an_id_again_returns_its_seq_and_adds_nothing() {
+    let Fixture { bus, .. } = &fixture();
+    let seq = bus.publish("events", &message("a")).unwrap();
+    let other = Message::new("producer.other", json!(2)).id(message("a").id);
+    assert_eq!(bus.publish("events", &other).unwrap(), seq);
+    // A duplicate uses up no seq.
+    let next = bus.publish("events", &message("b")).unwrap();
+    assert_eq!(next, Seq(seq.0 + 1));
+    let pulled = bus.pull("inbox", 50).unwrap();
+    assert_eq!(names(&pulled), ["a", "b"]);
+    assert_eq!(pulled[0].message.kind, "producer.thing.happened");
+}
+
+#[test]
+fn an_ack_of_a_message_the_connection_does_not_read_is_refused() {
+    let Fixture {
+        bus, connection, ..
+    } = &fixture();
+    bus.declare(&Output::new("other")).unwrap();
+    let elsewhere = bus.publish("other", &message("x")).unwrap();
+    bus.publish("events", &message("a")).unwrap();
+
+    assert!(matches!(
+        bus.ack(*connection, elsewhere),
+        Err(Error::NotOnConnection { .. })
+    ));
+    assert!(matches!(
+        bus.ack(*connection, Seq(elsewhere.0 + 100)),
+        Err(Error::NotOnConnection { .. })
+    ));
+    assert_eq!(names(&bus.pull("inbox", 50).unwrap()), ["a"]);
+}
+
+#[test]
+fn a_bare_name_is_the_consumer_of_this_machine() {
+    let Fixture {
+        bus, connection, ..
+    } = &fixture();
+    let full = format!("inbox@{}", bus.id());
+    // Another way to write the same machine id is the same consumer too.
+    let other_form = format!("inbox@{}", bus.id().simple().to_string().to_uppercase());
+    assert_eq!(
+        bus.connect(&full, "events", Start::Now).unwrap(),
+        *connection
+    );
+    assert_eq!(
+        bus.connect(&other_form, "events", Start::Now).unwrap(),
+        *connection
+    );
+    assert_eq!(bus.connection(*connection).unwrap().consumer, full);
+
+    // The same name on another machine reads the output with a cursor of its own.
+    let far = format!("inbox@{}", Uuid::from_u128(7));
+    let other = bus.connect(&far, "events", Start::Now).unwrap();
+    assert_ne!(other, *connection);
+    let seq = bus.publish("events", &message("a")).unwrap();
+    bus.ack(*connection, seq).unwrap();
+    assert!(bus.pull(&full, 50).unwrap().is_empty());
+    assert_eq!(names(&bus.pull(&far, 50).unwrap()), ["a"]);
+
+    for bad in [
+        "",
+        "inbox@",
+        "inbox@box",
+        "@0196f1c2-7a3e-7c41-9b2d-5e8f0a1b2c3d",
+    ] {
+        assert!(
+            matches!(bus.pull(bad, 50), Err(Error::BadConsumer(_))),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
+fn only_a_declared_output_takes_messages_and_connections() {
+    let Fixture { bus, .. } = &fixture();
+    for bad in ["", TAP] {
+        assert!(matches!(
+            bus.declare(&Output::new(bad)),
+            Err(Error::BadOutput(_))
+        ));
+    }
+    assert!(matches!(
+        bus.publish("nowhere", &message("a")),
+        Err(Error::UnknownOutput(_))
+    ));
+    assert!(matches!(
+        bus.connect("inbox", "nowhere", Start::Now),
+        Err(Error::UnknownOutput(_))
+    ));
+}
+
+#[test]
+fn a_deleted_output_keeps_its_messages_and_comes_back_as_it_was() {
+    let Fixture {
+        bus, connection, ..
+    } = &fixture();
+    let tap = bus.connect("hook", TAP, Start::Now).unwrap();
+    let seq = bus.publish("events", &message("a")).unwrap();
+
+    assert_eq!(bus.delete("events").unwrap(), [*connection]);
+    assert!(bus.outputs().unwrap().is_empty());
+    assert!(matches!(
+        bus.publish("events", &message("b")),
+        Err(Error::DeletedOutput(_))
+    ));
+    assert!(matches!(
+        bus.connect("inbox", "events", Start::Now),
+        Err(Error::DeletedOutput(_))
+    ));
+    assert!(matches!(bus.delete("events"), Err(Error::DeletedOutput(_))));
+    assert!(bus.pull("inbox", 50).unwrap().is_empty());
+    // The tap stays, and still gets what the output published before it went.
+    let tapped = bus.pull("hook", 50).unwrap();
+    assert_eq!(names(&tapped), ["a"]);
+    assert_eq!(tapped[0].connection, tap);
+
+    let back = bus.declare(&Output::new("events")).unwrap();
+    assert!(back.connections.is_empty());
+    // It is the same output: its history, and its ids, which a retried publish finds.
+    assert_eq!(bus.publish("events", &message("a")).unwrap(), seq);
+    let history = MessageQuery {
+        output: Some("events".to_owned()),
+        ..MessageQuery::default()
+    };
+    assert_eq!(bus.messages(&history).unwrap().len(), 1);
+}
+
+#[test]
+fn a_file_of_a_newer_schema_is_refused_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bus.db");
+    let newer = rusqlite::Connection::open(&path).unwrap();
+    newer.pragma_update(None, "user_version", 99).unwrap();
+    drop(newer);
+    let before = std::fs::read(&path).unwrap();
+
+    assert!(matches!(
+        Bus::open(&path),
+        Err(Error::NewerSchema { found: 99, .. })
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(!dir.path().join("bus.db-wal").exists());
+}
+
+/// Programs at once, each with its own handle on the file: two publish while two consumers,
+/// one through a connection and one through a tap, pull and acknowledge. Each gets every
+/// message, and none twice.
+#[test]
+fn concurrent_publishers_and_consumers_lose_nothing() {
+    const PER_PRODUCER: usize = 200;
+    let Fixture { bus, path, .. } = &fixture();
+    bus.connect("hook", TAP, Start::Now).unwrap();
+    let producing = AtomicUsize::new(2);
+    let consume = |consumer: &str| {
+        let reader = Bus::open(path).unwrap();
+        let mut pulled = Vec::new();
+        loop {
+            // Read the count first: a pull after the producers are done sees all they published.
+            let done = producing.load(Ordering::SeqCst) == 0;
+            let batch = reader.pull(consumer, 7).unwrap();
+            for delivery in &batch {
+                pulled.push(delivery.message.id);
+                reader.ack(delivery.connection, delivery.seq).unwrap();
+            }
+            if done && batch.is_empty() {
+                return pulled;
+            }
+        }
+    };
+    let (inbox, tapped) = std::thread::scope(|scope| {
+        for producer in ["p", "q"] {
+            let producing = &producing;
+            scope.spawn(move || {
+                let bus = Bus::open(path).unwrap();
+                for n in 0..PER_PRODUCER {
+                    bus.publish("events", &message(&format!("{producer}{n}")))
+                        .unwrap();
+                }
+                producing.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+        let inbox = scope.spawn(|| consume("inbox"));
+        let tapped = scope.spawn(|| consume("hook"));
+        (inbox.join().unwrap(), tapped.join().unwrap())
+    });
+    for pulled in [inbox, tapped] {
+        assert_eq!(pulled.len(), 2 * PER_PRODUCER);
+        assert_eq!(
+            pulled.iter().collect::<HashSet<_>>().len(),
+            2 * PER_PRODUCER
+        );
+    }
+}
