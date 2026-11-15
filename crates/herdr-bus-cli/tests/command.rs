@@ -223,6 +223,22 @@ fn an_error_exits_1_with_its_json() {
     }
 }
 
+/// `--version`, as `--help`, succeeds on stdout, `--json` or not: `run` prints it itself, where
+/// clap's `exit` would end an app that embeds the command.
+#[test]
+fn the_version_succeeds_on_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    for args in [&["--version"][..], &["--version", "--json"][..]] {
+        let output = herdr_bus(&dir.path().join("bus.db"), args, None);
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("herdr-bus {}\n", env!("CARGO_PKG_VERSION")),
+        );
+        assert!(output.stderr.is_empty(), "{args:?}");
+    }
+}
+
 /// Programs that start together all open a bus file none has created yet: `SQLite`'s busy
 /// timeout does not cover the switch of a new file to WAL. Separate processes, since `SQLite`
 /// shares its locks between the connections of one.

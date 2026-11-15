@@ -13,7 +13,9 @@ command.
 - `herdr-bus`: the library.
 - `herdr-bus-client`: the client of a session (below), for a Rust consumer that waits.
 - `herdr-bus-cli`: the `herdr-bus` command, which gives every operation of the library, with
-  `--json`, to programs that cannot link Rust, and holds sessions (`herdr-bus serve`).
+  `--json`, to programs that cannot link Rust, and holds sessions (`herdr-bus serve`). An app
+  can ship it inside its own binary instead: invoked through a symbolic link named `herdr-bus`
+  on `PATH`, it calls `herdr_bus_cli::run(std::env::args_os())`.
 - `herdr-words`: the `herdr.words` message type, words someone wrote to an actor, for the
   programs that publish and read it to share one definition.
 

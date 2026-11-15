@@ -28,7 +28,9 @@ The checks the user runs, each with what it must show:
 5. An app that takes the crates by git: a new crate in a temporary folder whose `Cargo.toml`
    takes `herdr-bus` and `herdr-words` by `git` (a `file://` URL and the change's bookmark
    before it is pushed), and `rusqlite` 0.38 `bundled` as herdr-bowtie does, builds and runs
-   a round trip with `cargo run`, and builds no `clap`.
+   a round trip with `cargo run`, and builds no `clap`. Cargo's own git cannot open a
+   clone with `extensions.relativeworktrees` set, as `git worktree add` with relative paths
+   sets it: fetch with `CARGO_NET_GIT_FETCH_WITH_CLI=true`.
 6. A session: `$b serve c` in a terminal prints `{"ready":{}}`, then `{"notify":{}}` once `c`
    has messages; typing `{"get_messages":{"limit":10}}` prints them, and an `{"ack":…}` of one
    prints `{"acked":…}`. A publish from another shell prints one notify, however many follow
@@ -37,9 +39,20 @@ The checks the user runs, each with what it must show:
 7. Two machines on one output: `$b connect c out` and `$b connect "c@<another UUID>" out`
    make two connections, with cursors of their own: acking on one leaves the other's pull as
    it was.
-8. A deletion: `$b delete out` prints the connections it removed; `$b outputs` no longer
+8. An app that embeds the command: a new crate in a temporary folder that takes `herdr-bus-cli`
+   by `git`, as in check 5, and whose `main` calls `herdr_bus_cli::run(std::env::args_os())`
+   when the file name of its `argv[0]` is `herdr-bus`. Through a link of that name, each of
+   `--help`, `--version`, a round trip with `--json` and without, a usage error with
+   `--json` and without, and `serve`, prints what `$b` prints, on the same stream, and exits
+   with the same code. Run the same script of commands with each, on a bus file of its own,
+   ids and times masked with `sed`, and `diff` the outputs.
+9. A deletion: `$b delete out` prints the connections it removed; `$b outputs` no longer
    shows it, `$b publish out …` fails, a tap still pulls its messages, and `$b declare out`
    brings it back, with its messages and without its connections.
+
+A change that must leave the command's output as it was runs that script with a binary of the
+fixed point too (`cargo install --git file://… --rev <fixed point> --root <folder>
+herdr-bus-cli`), and `diff`s it with the change's.
 
 ## Watching the file
 

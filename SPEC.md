@@ -297,7 +297,13 @@ The binary must run on every machine whose bus a program reaches, with
 `hc exec` or a session, and be on `PATH` there, a login shell's for a
 session from another machine: the client crate runs `herdr-bus` by that
 name. Install it with `cargo install --git … herdr-bus-cli` (README.md); a
-program that ships its own build puts it on `PATH`.
+program that ships its own build puts it on `PATH`. Such a program can embed
+the command instead of shipping a second binary: the crate's lib has
+`herdr_bus_cli::run(args) -> ExitCode`, the whole command, which the
+binary only calls, `args` starting with the program's name; the program
+calls it when it is invoked through a symbolic link named `herdr-bus` on
+`PATH`, returns from `main` with its code, and ships one binary, with the
+command at the revision it links.
 
 The CLI is the way in for non-Rust programs (other languages, shell
 scripts) and for herdr-patch, since a mod can't link a

@@ -9,7 +9,8 @@ the `herdr-bus` command. Its Rust crates live in `crates/<name>/`, which the wor
 - `crates/herdr-bus-client`: the client of a session with `herdr-bus serve`, and the session's
   lines, which `serve` speaks too.
 - `crates/herdr-bus-cli`: the `herdr-bus` command, `serve` included, and its skill. Apart, so
-  that an app linking the library builds none of the command.
+  that an app linking the library builds none of the command. Its lib's `run` is the whole
+  command: the binary only calls it, and an app can embed it.
 - `crates/herdr-words`: the `herdr.words` shared type. A new shared type gets a crate of its own.
 
 ## How the apps use it
