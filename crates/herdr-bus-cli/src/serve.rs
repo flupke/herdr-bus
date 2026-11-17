@@ -1,35 +1,28 @@
 //! `herdr-bus serve`: a session with one consumer, in JSON lines over stdin and stdout, as
 //! `herdr_bus_client::protocol` describes them. It tells the consumer when it has messages
-//! past those the session delivered, and sends messages only when asked.
+//! past those the session delivered, and sends messages only when asked. It publishes, asks,
+//! takes and replies to requests for the consumer, and sends the reply or timeout of each
+//! request it asked once there is one.
 //!
-//! It learns of writes by watching the bus file's folder: every write modifies the `-wal` file,
-//! and no read does. The event comes before the write can be read, so it looks a moment later,
-//! and now and then without an event too (`.agents/wiki/shell-checks.md`, Watching the file).
+//! It learns of writes by watching the bus file's folder ([`crate::watch`]), and wakes at the
+//! nearest deadline of the requests it asked.
 
 use std::collections::HashMap;
 use std::error::Error;
-use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use herdr_bus::{Bus, ConnectionId, Error as BusError, Seq};
-use herdr_bus_client::protocol::{Line, Request};
-use notify::event::ModifyKind;
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use herdr_bus::{Bus, ConnectionId, Error as BusError, Outcome, Seq, Timestamp, Uuid};
+use herdr_bus_client::protocol::{Call, Line};
 
-/// How long after a write's event the session looks at the bus: 30 ms after it, a read saw
-/// every write in the runs the wiki records.
-const SETTLE: Duration = Duration::from_millis(30);
-
-/// How long the session waits without an event before it looks anyway.
-const BACKSTOP: Duration = Duration::from_secs(1);
+use crate::watch::{BACKSTOP, SETTLE, instant_of, watch};
 
 /// What wakes the session.
 enum Event {
     /// A line from the consumer.
-    Request(String),
+    Line(String),
     /// A line from the consumer that is not UTF-8.
     Unreadable,
     /// The `-wal` file was modified: something was written.
@@ -43,19 +36,24 @@ pub(crate) fn serve(bus: Bus, path: &Path, consumer: &str) -> Result<(), Box<dyn
     // Refuses a name that is no consumer's before the session starts.
     bus.positions(consumer)?;
     let (events, received) = mpsc::channel();
-    // SQLite puts the `-wal` file beside the file a symbolic link names. Without a watcher, as
-    // where the system has none left to give, the session looks once a second all the same.
-    let _watcher = watch(&std::fs::canonicalize(path)?, events.clone())
-        .inspect_err(|error| {
-            eprintln!("herdr-bus serve: cannot watch the bus file, looks once a second: {error}");
-        })
-        .ok();
-    std::thread::spawn(move || read_requests(&events));
+    // Without a watcher, as where the system has none left to give, the session looks once a
+    // second all the same.
+    let written = events.clone();
+    let _watcher = watch(path, move || {
+        let _ = written.send(Event::Written);
+    })
+    .inspect_err(|error| {
+        eprintln!("herdr-bus serve: cannot watch the bus file, looks once a second: {error}");
+    })
+    .ok();
+    std::thread::spawn(move || read_lines(&events));
     let session = Session {
         bus,
         consumer: consumer.to_owned(),
         delivered: HashMap::new(),
         notified: false,
+        asked: Vec::new(),
+        nearest: None,
     };
     match session.run(&received, &mut io::stdout().lock()) {
         // The consumer stopped reading: it has ended the session.
@@ -71,6 +69,11 @@ struct Session {
     delivered: HashMap<ConnectionId, Seq>,
     /// Whether the consumer was notified since it last asked for its messages.
     notified: bool,
+    /// Each request the session asked that has no outcome yet, its seq and id: one entry for
+    /// each ask, which gets one reply or timeout.
+    asked: Vec<(Seq, Uuid)>,
+    /// The nearest deadline of the requests in `asked`.
+    nearest: Option<Timestamp>,
 }
 
 impl Session {
@@ -83,33 +86,40 @@ impl Session {
         self.look(out)?;
         let mut due = Instant::now() + BACKSTOP;
         loop {
-            match events.recv_timeout(due.saturating_duration_since(Instant::now())) {
-                Ok(Event::Request(line)) => {
+            let wake = self
+                .nearest
+                .map_or(due, |nearest| due.min(instant_of(nearest)));
+            match events.recv_timeout(wake.saturating_duration_since(Instant::now())) {
+                Ok(Event::Line(line)) => {
                     if !line.trim().is_empty() {
                         self.answer(&line, out)?;
                         self.look(out)?;
                     }
                 }
                 Ok(Event::Unreadable) => {
-                    send(out, &Line::Error("a request is a line of UTF-8".to_owned()))?;
+                    send(out, &Line::Error("a line is UTF-8".to_owned()))?;
                 }
                 Ok(Event::Written) => due = due.min(Instant::now() + SETTLE),
                 Ok(Event::Closed) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
                 Err(RecvTimeoutError::Timeout) => {
                     self.look(out)?;
-                    due = Instant::now() + BACKSTOP;
+                    // A deadline may have woken it before a write had settled.
+                    if Instant::now() >= due {
+                        due = Instant::now() + BACKSTOP;
+                    }
                 }
             }
         }
     }
 
-    /// Notifies the consumer, once, when it has messages past those the session delivered.
+    /// Notifies the consumer, once, when it has messages past those the session delivered,
+    /// and sends the outcome of each request it asked that has one.
     fn look(&mut self, out: &mut impl Write) -> Result<(), Box<dyn Error>> {
         if !self.notified && self.has_new()? {
             send(out, &Line::Notify {})?;
             self.notified = true;
         }
-        Ok(())
+        self.settle(out)
     }
 
     fn has_new(&self) -> herdr_bus::Result<bool> {
@@ -124,18 +134,77 @@ impl Session {
         }))
     }
 
+    /// Sends the reply or timeout of each request the session asked that has one, and keeps
+    /// the nearest deadline of the others.
+    fn settle(&mut self, out: &mut impl Write) -> Result<(), Box<dyn Error>> {
+        self.nearest = None;
+        for (seq, id) in std::mem::take(&mut self.asked) {
+            match self.bus.outcome(seq)? {
+                Outcome::Pending { deadline } => {
+                    self.nearest = Some(self.nearest.map_or(deadline, |n| n.min(deadline)));
+                    self.asked.push((seq, id));
+                }
+                Outcome::Replied(reply) => send(
+                    out,
+                    &Line::Reply {
+                        to: seq,
+                        id,
+                        data: reply.data,
+                    },
+                )?,
+                Outcome::TimedOut { taken } => {
+                    send(out, &Line::Timeout { to: seq, id, taken })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn answer(&mut self, line: &str, out: &mut impl Write) -> io::Result<()> {
-        let answer = match serde_json::from_str::<Request>(line) {
-            Ok(request) => self.carry_out(&request).unwrap_or_else(Line::Error),
-            Err(error) => Line::Error(format!("not a request: {error}")),
+        let answer = match serde_json::from_str::<Call>(line) {
+            Ok(call) => self.carry_out(call).unwrap_or_else(Line::Error),
+            Err(error) => Line::Error(format!("not a line of the session: {error}")),
         };
         send(out, &answer)
     }
 
-    fn carry_out(&mut self, request: &Request) -> Result<Line, String> {
-        match *request {
-            Request::GetMessages { limit } => self.get_messages(limit),
-            Request::Ack { connection, seq } => self.ack(connection, seq),
+    fn carry_out(&mut self, call: Call) -> Result<Line, String> {
+        let bus = &self.bus;
+        match call {
+            Call::GetMessages { limit } => self.get_messages(limit),
+            Call::Ack { connection, seq } => self.ack(connection, seq),
+            Call::Publish { output, message } => {
+                let seq = bus
+                    .publish(&output, &message)
+                    .map_err(|error| error.to_string())?;
+                Ok(Line::Published {
+                    seq,
+                    id: message.id,
+                })
+            }
+            Call::Request {
+                output,
+                message,
+                timeout_ms,
+            } => {
+                let timeout = Duration::from_millis(timeout_ms);
+                let seq = bus
+                    .request(&output, &message, timeout)
+                    .map_err(|error| error.to_string())?;
+                self.asked.push((seq, message.id));
+                Ok(Line::Requested {
+                    seq,
+                    id: message.id,
+                })
+            }
+            Call::Take { seq } => Ok(Line::Taken {
+                seq,
+                state: bus.take(seq).map_err(|error| error.to_string())?,
+            }),
+            Call::Reply { to, data } => {
+                bus.reply(to, data).map_err(|error| error.to_string())?;
+                Ok(Line::Replied { to })
+            }
         }
     }
 
@@ -184,7 +253,7 @@ fn send(out: &mut impl Write, line: &Line) -> io::Result<()> {
     out.flush()
 }
 
-fn read_requests(events: &Sender<Event>) {
+fn read_lines(events: &Sender<Event>) {
     let mut stdin = io::stdin().lock();
     let mut line = Vec::new();
     loop {
@@ -193,7 +262,7 @@ fn read_requests(events: &Sender<Event>) {
             break;
         }
         let event = match String::from_utf8(std::mem::take(&mut line)) {
-            Ok(line) => Event::Request(line),
+            Ok(line) => Event::Line(line),
             Err(_) => Event::Unreadable,
         };
         if events.send(event).is_err() {
@@ -201,34 +270,6 @@ fn read_requests(events: &Sender<Event>) {
         }
     }
     let _ = events.send(Event::Closed);
-}
-
-/// Watches the folder of the bus file at `path` for modifications of its `-wal` file. The
-/// folder, not the file, which goes whenever the last program closes the bus.
-fn watch(path: &Path, events: Sender<Event>) -> notify::Result<RecommendedWatcher> {
-    let folder = path
-        .parent()
-        .filter(|folder| !folder.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let mut wal = OsString::from(path.file_name().unwrap_or_default());
-    wal.push("-wal");
-    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-        let Ok(event) = event else { return };
-        let modified = matches!(
-            event.kind,
-            EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Any)
-        );
-        if modified
-            && event
-                .paths
-                .iter()
-                .any(|path| path.file_name() == Some(&wal))
-        {
-            let _ = events.send(Event::Written);
-        }
-    })?;
-    watcher.watch(folder, RecursiveMode::NonRecursive)?;
-    Ok(watcher)
 }
 
 fn is_broken_pipe(error: &(dyn Error + 'static)) -> bool {

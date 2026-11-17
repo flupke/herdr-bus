@@ -362,3 +362,117 @@ fn concurrent_publishers_and_consumers_lose_nothing() {
         );
     }
 }
+
+const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+
+#[test]
+fn a_request_is_taken_once_and_keeps_its_first_reply() {
+    let Fixture { bus, .. } = &fixture();
+    let seq = bus.request("events", &message("ask"), HOUR).unwrap();
+    let Outcome::Pending { deadline } = bus.outcome(seq).unwrap() else {
+        panic!("a request just asked is pending");
+    };
+    // Asked again, after a crash of its asker: the same request, deadline included.
+    assert_eq!(
+        bus.request("events", &message("ask"), HOUR * 2).unwrap(),
+        seq
+    );
+    assert_eq!(bus.outcome(seq).unwrap(), Outcome::Pending { deadline });
+    let request = |bus: &Bus| bus.pull("inbox", 50).unwrap()[0].request.unwrap();
+    assert_eq!(
+        request(bus),
+        RequestState {
+            deadline,
+            taken: false,
+            replied: false
+        }
+    );
+
+    assert_eq!(bus.take(seq).unwrap(), Take::Taken);
+    // The consumer crashed after its take: the request comes back, marked taken.
+    assert!(request(bus).taken);
+    assert_eq!(bus.take(seq).unwrap(), Take::TakenBefore);
+
+    assert_eq!(
+        bus.reply(seq, json!({"answer": 1})).unwrap().data,
+        json!({"answer": 1})
+    );
+    assert_eq!(
+        bus.reply(seq, json!({"answer": 2})).unwrap().data,
+        json!({"answer": 1})
+    );
+    assert!(request(bus).replied);
+    assert_eq!(bus.take(seq).unwrap(), Take::Replied);
+    let Outcome::Replied(reply) = bus.outcome(seq).unwrap() else {
+        panic!("a request replied to has its reply");
+    };
+    assert_eq!(reply.data, json!({"answer": 1}));
+    assert_eq!(
+        bus.message(seq).unwrap().request.unwrap().reply,
+        Some(reply)
+    );
+}
+
+#[test]
+fn a_request_past_its_deadline_that_nobody_took_is_never_handled() {
+    let Fixture { bus, .. } = &fixture();
+    // A timeout of nothing: the deadline is now.
+    let seq = bus
+        .request("events", &message("late"), std::time::Duration::ZERO)
+        .unwrap();
+    assert_eq!(bus.take(seq).unwrap(), Take::Expired);
+    assert!(matches!(bus.reply(seq, json!(1)), Err(Error::Expired(_))));
+    assert_eq!(
+        bus.outcome(seq).unwrap(),
+        Outcome::TimedOut { taken: false }
+    );
+    assert_eq!(bus.take(seq).unwrap(), Take::Expired);
+}
+
+#[test]
+fn a_request_taken_before_its_deadline_still_takes_its_reply_after_it() {
+    let Fixture { bus, .. } = &fixture();
+    let seq = bus.request("events", &message("slow"), HOUR).unwrap();
+    assert_eq!(bus.take(seq).unwrap(), Take::Taken);
+    // The hour goes by while the consumer works.
+    bus.sql
+        .execute(
+            "UPDATE requests SET deadline = ?1",
+            ["2000-01-01T00:00:00Z"],
+        )
+        .unwrap();
+    assert_eq!(bus.outcome(seq).unwrap(), Outcome::TimedOut { taken: true });
+    assert_eq!(bus.take(seq).unwrap(), Take::TakenBefore);
+
+    bus.reply(seq, json!("done")).unwrap();
+    // Asked again, it returns the reply.
+    assert_eq!(bus.request("events", &message("slow"), HOUR).unwrap(), seq);
+    let Outcome::Replied(reply) = bus.outcome(seq).unwrap() else {
+        panic!("the reply stands");
+    };
+    assert_eq!(reply.data, json!("done"));
+}
+
+#[test]
+fn only_a_request_is_taken_or_replied_to() {
+    let Fixture { bus, .. } = &fixture();
+    let plain = bus.publish("events", &message("plain")).unwrap();
+    assert!(matches!(
+        bus.request("events", &message("plain"), HOUR),
+        Err(Error::PlainMessage { .. })
+    ));
+    for seq in [plain, Seq(plain.0 + 100)] {
+        assert!(matches!(bus.take(seq), Err(Error::NotARequest(_))));
+        assert!(matches!(
+            bus.reply(seq, json!(1)),
+            Err(Error::NotARequest(_))
+        ));
+        assert!(matches!(bus.outcome(seq), Err(Error::NotARequest(_))));
+    }
+    // A plain message's delivery carries no request.
+    assert_eq!(bus.pull("inbox", 50).unwrap()[0].request, None);
+    assert!(matches!(
+        bus.request("nowhere", &message("a"), HOUR),
+        Err(Error::UnknownOutput(_))
+    ));
+}

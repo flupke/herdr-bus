@@ -5,7 +5,8 @@ backends, agents' tools, scripts. A program declares its outputs and publishes m
 A consumer, named `<name>@<machine id>` or by its bare name on its own machine, connects to the
 outputs it reads: each connection holds a cursor, the consumer acknowledges each message it
 handled, and one it did not comes back on its next pull, after a crash too. A tap reads every
-output, present and future. [SPEC.md](SPEC.md) holds the model, the schema, the library and the
+output, present and future. A request is a message with a deadline that takes one reply, which
+its asker waits for. [SPEC.md](SPEC.md) holds the model, the schema, the library and the
 command.
 
 ## Crates
@@ -45,6 +46,17 @@ herdr-bus pull inbox --json              # [{"connection": 1, "seq": 1, "output"
 herdr-bus ack 1 1
 ```
 
+A program that needs an answer asks a request, and the consumer that answers takes it before
+it works on it, then replies:
+
+```sh
+herdr-bus request asks --type app.question --timeout 5s --data '{"q": 1}'
+                                         # waits; prints the reply's data, or exits 2 once
+                                         # the deadline passed, saying whether it was taken
+herdr-bus take 2                         # taken, taken_before, replied or expired
+herdr-bus reply 2 --data '{"a": 2}'
+```
+
 A message's id is a UUID. A producer that may retry a publish gives its own with `--id`,
 generated before the first attempt, so that the retry adds nothing; one whose own ids are not
 UUIDs derives them with UUIDv5.
@@ -57,7 +69,8 @@ machine's through a session there, as `<name>@<its own machine's id>`.
 A consumer that waits for its messages holds a session: it runs `herdr-bus serve <consumer>`,
 through `ssh` or any command that gives a pipe for another machine's bus, and speaks to it in
 JSON lines. `serve` notifies it when it has messages, sends them when it asks, at most as many
-as it asks for, and takes its acknowledgements ([SPEC.md](SPEC.md), Sessions).
+as it asks for, and takes its acknowledgements. Through a session, a program also publishes,
+asks, takes and replies on that machine's bus ([SPEC.md](SPEC.md), Sessions).
 
 `herdr-bus delete` deletes an output and its connections; its messages and the taps stay, and
 declaring it again brings it back.
@@ -79,7 +92,7 @@ A consumer that waits pulls through `herdr_bus_client::Client`, whose `pull` wai
 is nothing:
 
 ```rust
-let mut client = Client::connect(BusLocation::Local, "inbox")?;   // or Machine("box".into()), or Command(…)
+let client = Client::connect(BusLocation::Local, "inbox")?;   // or Machine("box".into()), or Command(…)
 loop {
     for delivery in client.pull(50)? {
         handle(&delivery.message)?;
@@ -91,8 +104,11 @@ loop {
 It runs `herdr-bus serve` from `PATH`; for `Machine`, a machine of `hc machine ls`, it runs it
 over `ssh` from a login shell's `PATH` there, as this machine's consumer. A machine that hc
 reaches through a command of its own (`hc machine add --via`) is reached with `Command`, given
-that command: the client appends the line to run there as its last argument. Once the session ends,
-`pull` and `ack` return an error, and the app connects again: nothing is lost.
+that command: the client appends the line to run there as its last argument. Every method takes
+`&self`, so that threads share one session: one waits in `pull` while others `publish`, `ack`,
+`take` and `reply`, and several wait in `request` at once. Once the session ends, or `close()`
+ends it from any thread, every call returns an error, and the app connects again: nothing is
+lost.
 
 `herdr_bus::Timestamp`, a message's `time`, is `jiff`'s, re-exported. The bus links SQLite
 through `rusqlite` 0.38 with its `bundled` feature. An app that links SQLite through `rusqlite`

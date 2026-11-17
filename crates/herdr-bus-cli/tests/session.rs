@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use herdr_bus::{Bus, Message, Output, Start, Timestamp, Uuid};
-use herdr_bus_client::{BusLocation, Client, Error};
+use herdr_bus_client::{BusLocation, Client, Error, Outcome};
 use serde_json::{Value, json};
 
 /// A `herdr-bus serve` the test speaks to line by line.
@@ -118,7 +118,7 @@ fn serve_sends_messages_only_when_asked() {
     assert_eq!(serve.receive(), notify);
 
     // An ack of a message not delivered yet is refused, and moves nothing; so are a line that
-    // is no request and a limit of 0, and the session goes on.
+    // is not one of the session and a limit of 0, and the session goes on.
     serve.send(r#"{"ack": {"connection": 1, "seq": 3}}"#);
     assert!(serve.receive()["error"].is_string());
     serve.send(r#"{"get_messages": {"limit": 0}}"#);
@@ -179,6 +179,95 @@ fn a_session_follows_its_consumers_connections_as_they_come_and_go() {
     assert_eq!(serve.receive(), json!({ "messages": [] }));
 }
 
+/// A message line of the session: only `type` and `data` are required.
+fn ask(n: u128, timeout_ms: u64) -> String {
+    let id = Uuid::from_u128(n);
+    format!(
+        r#"{{"request": {{"output": "out", "message": {{"id": "{id}", "type": "t", "data": {n}}}, "timeout_ms": {timeout_ms}}}}}"#
+    )
+}
+
+#[test]
+fn serve_publishes_and_asks_and_answers_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = &dir.path().join("bus.db");
+    let bus = bus(db, &[]);
+    let mut serve = Serve::start(db, &["serve", "c"]);
+    assert_eq!(serve.receive(), json!({ "ready": {} }));
+
+    serve.send(r#"{"publish": {"output": "out", "message": {"type": "t", "data": 1}}}"#);
+    let published = serve.receive();
+    assert_eq!(published["published"]["seq"], json!(1));
+    assert!(published["published"]["id"].is_string(), "{published}");
+    assert_eq!(serve.receive(), json!({ "notify": {} }));
+
+    // Nobody takes it before its deadline, which is now.
+    serve.send(&ask(2, 0));
+    let id = |n: u128| json!(Uuid::from_u128(n));
+    assert_eq!(
+        serve.receive(),
+        json!({ "requested": { "seq": 2, "id": id(2) } })
+    );
+    assert_eq!(
+        serve.receive(),
+        json!({ "timeout": { "to": 2, "id": id(2), "taken": false } })
+    );
+    serve.send(r#"{"take": {"seq": 2}}"#);
+    assert_eq!(
+        serve.receive(),
+        json!({ "taken": { "seq": 2, "state": "expired" } })
+    );
+
+    // Three wait at once, and the session goes on meanwhile.
+    for n in 3..=5 {
+        serve.send(&ask(n, 3_600_000));
+        assert_eq!(
+            serve.receive(),
+            json!({ "requested": { "seq": n, "id": id(n) } })
+        );
+    }
+    serve.send(r#"{"get_messages": {"limit": 10}}"#);
+    let messages = serve.receive();
+    let request = &messages["messages"][2]["request"];
+    assert_eq!(
+        (request["taken"].clone(), request["replied"].clone()),
+        (json!(false), json!(false))
+    );
+    assert!(
+        messages["messages"][0].get("request").is_none(),
+        "{messages}"
+    );
+
+    // Replies come in any order, each as it is given, each naming its request.
+    serve.send(r#"{"take": {"seq": 4}}"#);
+    assert_eq!(
+        serve.receive(),
+        json!({ "taken": { "seq": 4, "state": "taken" } })
+    );
+    serve.send(r#"{"reply": {"to": 4, "data": {"answer": 4}}}"#);
+    assert_eq!(serve.receive(), json!({ "replied": { "to": 4 } }));
+    assert_eq!(
+        serve.receive(),
+        json!({ "reply": { "to": 4, "id": id(4), "data": { "answer": 4 } } })
+    );
+    // Another program replies: the session learns it from the bus.
+    bus.reply(herdr_bus::Seq(5), json!("five")).unwrap();
+    assert_eq!(
+        serve.receive(),
+        json!({ "reply": { "to": 5, "id": id(5), "data": "five" } })
+    );
+    serve.send(r#"{"reply": {"to": 3, "data": null}}"#);
+    assert_eq!(serve.receive(), json!({ "replied": { "to": 3 } }));
+    assert_eq!(
+        serve.receive(),
+        json!({ "reply": { "to": 3, "id": id(3), "data": null } })
+    );
+
+    // A line the session does not know is refused.
+    serve.send(r#"{"cancel": {"seq": 3}}"#);
+    assert!(serve.receive()["error"].is_string());
+}
+
 #[test]
 fn serve_refuses_a_name_that_is_no_consumers() {
     let dir = tempfile::tempdir().unwrap();
@@ -200,11 +289,12 @@ const FAKES: &str = "HERDR_BUS_TEST_FAKES";
 /// A folder of fake commands for the client, first on `PATH`, beside a bus file where the
 /// consumer `app` of this machine reads `out`, which holds no message yet:
 ///
-/// - `herdr-bus`, the built one, but which publishes `late` on `out` once `serve` has answered
-///   an empty `messages`: a client that pulls then gets `late` only if it waited for it. It
-///   holds the first messages `serve` sends until it has published `next` and `serve` has
-///   notified it, so that this notify reaches the client before the answer to its next
-///   request. For the consumer `dies`, it answers `ready`, then ends as a dead link does.
+/// - `herdr-bus`, the built one, but which, for the consumer `app` of any machine, publishes `late` on `out`
+///   once `serve` has answered an empty `messages`: a client that pulls then gets `late` only
+///   if it waited for it. It holds the first messages `serve` sends `app` until it has
+///   published `next` and `serve` has notified it, so that this notify reaches the client
+///   before the answer to its next call. For the consumer `dies`, it answers `ready`, then
+///   ends as a dead link does.
 /// - `hc`, whose `machine ls --json` lists `box`, reached by ssh at `me@box.example:2222`;
 ///   `down`, at `down.example`; and `relay`, reached through a command it does not show.
 /// - `ssh`, which writes its arguments to `ssh-args`, one a line, prints a line as a login
@@ -232,6 +322,10 @@ impl Fakes {
   echo "link died" >&2
   exit 255
 fi
+case "$3" in
+  app|app@*) ;;
+  *) exec '{real}' "$@" ;;
+esac
 late= next=
 '{real}' "$@" | while IFS= read -r line; do
   case "$line" in
@@ -335,7 +429,7 @@ fn the_client_waits_for_a_message_then_returns_it() {
 #[test]
 #[ignore = "the_client_waits_for_a_message_then_returns_it runs it, in a process of its own"]
 fn client_here() {
-    let mut client = Client::connect(BusLocation::Local, "app").unwrap();
+    let client = Client::connect(BusLocation::Local, "app").unwrap();
     // `out` holds nothing until `serve` has answered the pull empty.
     let deliveries = client.pull(10).unwrap();
     assert_eq!(data_names(&deliveries), ["late"]);
@@ -357,7 +451,7 @@ fn client_here() {
     assert!(why.contains("bad consumer"), "{why}");
 
     // A session that ends says why too, at each call from then on, a write to it or a read.
-    let mut client = Client::connect(BusLocation::Local, "dies").unwrap();
+    let client = Client::connect(BusLocation::Local, "dies").unwrap();
     for _ in 0..2 {
         let Err(Error::Session(why)) = client.ack(deliveries[0].connection, deliveries[0].seq)
         else {
@@ -377,7 +471,7 @@ fn the_client_reaches_another_machine_through_ssh() {
 fn client_on_a_machine() {
     let fakes = Fakes::here();
     let id = Bus::open(&fakes.join("bus.db")).unwrap().id();
-    let mut client = Client::connect(BusLocation::Machine("box".to_owned()), "app").unwrap();
+    let client = Client::connect(BusLocation::Machine("box".to_owned()), "app").unwrap();
     // The bare name went as this machine's consumer, whose connection reads `out`.
     assert_eq!(data_names(&client.pull(10).unwrap()), ["late"]);
     let args = std::fs::read_to_string(fakes.join("ssh-args")).unwrap();
@@ -429,7 +523,7 @@ fn client_through_a_command() {
     let id = Bus::open(&fakes.join("bus.db")).unwrap().id();
     // The fake `ssh` runs its last argument as the command of `hc machine add --via` does.
     let via = |args: &[&str]| BusLocation::Command(args.iter().map(|&arg| arg.into()).collect());
-    let mut client = Client::connect(via(&["ssh", "-a", "relay", "-C"]), "app").unwrap();
+    let client = Client::connect(via(&["ssh", "-a", "relay", "-C"]), "app").unwrap();
     // The bare name went as this machine's consumer, whose connection reads `out`.
     assert_eq!(data_names(&client.pull(10).unwrap()), ["late"]);
     let args = std::fs::read_to_string(fakes.join("ssh-args")).unwrap();
@@ -453,6 +547,84 @@ fn client_through_a_command() {
     );
     assert!(matches!(
         Client::connect(via(&[]), "app"),
+        Err(Error::Session(_))
+    ));
+}
+
+#[test]
+fn the_client_shares_one_session_between_threads() {
+    Fakes::new().run_alone("client_shared");
+}
+
+#[test]
+#[ignore = "the_client_shares_one_session_between_threads runs it, in a process of its own"]
+fn client_shared() {
+    let bus = Bus::open(&Fakes::here().join("bus.db")).unwrap();
+    bus.declare(&Output::new("asks")).unwrap();
+    bus.connect("answerer", "asks", Start::Beginning).unwrap();
+    // The asker reads nothing: a consumer with no connection.
+    let asker = Client::connect(BusLocation::Local, "asker").unwrap();
+    let answerer = Client::connect(BusLocation::Local, "answerer").unwrap();
+    let hour = std::time::Duration::from_secs(3600);
+    let question = |n: u128| Message::new("t", json!(n)).id(Uuid::from_u128(n));
+
+    std::thread::scope(|scope| {
+        let askers: Vec<_> = (1..=3)
+            .map(|n| {
+                let asker = &asker;
+                scope.spawn(move || asker.request("asks", &question(n), hour).unwrap())
+            })
+            .collect();
+        // One thread answers the three, the last asked first, while the askers wait and
+        // another thread publishes.
+        let answering = scope.spawn(|| {
+            // A pull returns again what was not acknowledged.
+            let mut pulled = std::collections::BTreeMap::new();
+            while pulled.len() < 3 {
+                for delivery in answerer.pull(10).unwrap() {
+                    pulled.insert(delivery.seq, delivery);
+                }
+            }
+            for delivery in pulled.values().rev() {
+                assert_eq!(answerer.take(delivery.seq).unwrap(), herdr_bus::Take::Taken);
+                let n = delivery.message.data.as_u64().unwrap();
+                answerer.reply(delivery.seq, json!(n * 10)).unwrap();
+                answerer.ack(delivery.connection, delivery.seq).unwrap();
+            }
+        });
+        asker.publish("out", &question(9)).unwrap();
+        answering.join().unwrap();
+        for (n, asking) in (1..=3).zip(askers) {
+            assert_eq!(asking.join().unwrap(), Outcome::Reply(json!(n * 10)));
+        }
+    });
+    assert_eq!(
+        asker
+            .request("out", &question(4), std::time::Duration::ZERO)
+            .unwrap(),
+        Outcome::Timeout { taken: false }
+    );
+
+    // A close from another thread ends the calls of the session, those that wait and those that
+    // come after (the client's own tests hold the first). The requests go on `out`, which the
+    // answerer does not read: its pull waits too.
+    std::thread::scope(|scope| {
+        let waiting = scope.spawn(|| asker.request("out", &question(5), hour));
+        let pulling = scope.spawn(|| answerer.pull(10));
+        asker.close();
+        answerer.close();
+        for ended in [
+            waiting.join().unwrap().map(drop),
+            pulling.join().unwrap().map(drop),
+        ] {
+            let Err(Error::Session(why)) = ended else {
+                panic!("a call outlived its session: {ended:?}");
+            };
+            assert!(why.contains("closed"), "{why}");
+        }
+    });
+    assert!(matches!(
+        asker.publish("out", &question(6)),
         Err(Error::Session(_))
     ));
 }

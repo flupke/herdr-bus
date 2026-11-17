@@ -1,11 +1,12 @@
 //! A consumer's session with a bus, on this machine or another: the client starts `herdr-bus
-//! serve <consumer>` there, and pulls and acknowledges the consumer's messages through it.
-//! Where the bus has no message for it, [`Client::pull`] waits for one.
+//! serve <consumer>` there, and pulls and acknowledges the consumer's messages through it,
+//! publishes, and asks, takes and replies to requests. Where the bus has no message for it,
+//! [`Client::pull`] waits for one; [`Client::request`] waits for the reply.
 //!
 //! ```no_run
 //! use herdr_bus_client::{BusLocation, Client};
 //!
-//! let mut client = Client::connect(BusLocation::Local, "app")?;
+//! let client = Client::connect(BusLocation::Local, "app")?;
 //! loop {
 //!     for delivery in client.pull(50)? {
 //!         println!("{}", delivery.message.data);
@@ -15,26 +16,34 @@
 //! # Ok::<(), herdr_bus_client::Error>(())
 //! ```
 //!
-//! Once the session ends, `serve` gone or the link to its machine dead, [`Client::pull`] and
-//! [`Client::ack`] return an error, with what the command wrote on stderr: the caller connects
-//! again. Cursors stay in the bus file, so
-//! a new session loses nothing, and its first pull returns at once what waited.
+//! Every method takes `&self`, and a client is `Send` and `Sync`: one thread waits in
+//! [`Client::pull`] while others publish, ask, take, reply and acknowledge, and several wait
+//! in [`Client::request`] at once. [`Client::close`], from any thread, ends the session.
+//!
+//! Once the session ends, `serve` gone, the link to its machine dead or the client closed,
+//! every waiting and later call returns an error, with what the command wrote on stderr: the
+//! caller connects again. Cursors and requests stay in the bus file, so a new session loses
+//! nothing: its first pull returns at once what waited, and a request asked again under its id
+//! is the same request.
 //!
 //! The session is one JSON line each way over the command's stdin and stdout: the lines of
 //! [`protocol`], which `serve` speaks too.
 
 pub mod protocol;
+mod reader;
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
-use herdr_bus::{Bus, ConnectionId, Delivery, Seq};
+use herdr_bus::{Bus, ConnectionId, Delivery, Message, Seq, Take};
 use serde::Deserialize;
+use serde_json::Value;
 
-use crate::protocol::{Line, Request};
+use crate::protocol::{Call, Line};
+use crate::reader::Waiters;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -46,9 +55,16 @@ pub enum Error {
         program: String,
         source: std::io::Error,
     },
-    /// The session did not start, `serve` refused a request, or the session ended.
+    /// The session did not start, `serve` refused a call, or the session ended.
     #[error("session: {0}")]
     Session(String),
+    /// `serve` said nothing of a request [`GRACE`] past its deadline: the link went silent,
+    /// and the request may have been taken.
+    #[error(
+        "session: herdr-bus serve {0} said nothing of the request past its deadline: the link \
+         went silent, and the request may have been taken"
+    )]
+    Silent(String),
 }
 
 /// Where the bus is: each machine has its own.
@@ -63,23 +79,35 @@ pub enum BusLocation {
     Command(Vec<String>),
 }
 
+/// What became of a request: [`Client::request`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum Outcome {
+    /// Its reply's data.
+    Reply(Value),
+    /// Its deadline passed with no reply. `taken: false` is final: nobody will ever handle
+    /// it.
+    Timeout { taken: bool },
+}
+
 /// A session with `herdr-bus serve`, which runs as a process of its own.
 pub struct Client {
-    child: Child,
-    to_serve: Option<ChildStdin>,
-    from_serve: BufReader<ChildStdout>,
-    /// The end of what the command wrote on stderr, which a thread reads for the whole
-    /// session, so that a full pipe never blocks it: read once the session ended, to say why.
-    stderr: Arc<Mutex<Vec<u8>>>,
-    /// Closed once the thread read all of stderr.
-    stderr_read: Receiver<()>,
+    /// The lines for `serve`, which a thread of their own writes on its stdin, so that no call
+    /// blocks on a link that stopped reading. Held while a line is queued, so that lines go in
+    /// the order their answers are expected; none once the session is stopped.
+    to_serve: Mutex<Option<Sender<String>>>,
+    /// The callers waiting for what `serve` sends, to whom the thread that reads it hands each
+    /// line.
+    waiters: Arc<Waiters>,
+    child: Mutex<Child>,
     /// Where `serve` runs, for errors: `here`, `on <machine>`, or `through <program>`.
     place: String,
-    /// Whether `serve` answered `ready`.
-    started: bool,
-    /// Why the session ended, once it has: every later call fails with it.
-    ended: Option<String>,
+    /// [`GRACE`], which a test shortens.
+    grace: Duration,
 }
+
+/// How long past a request's deadline [`Client::request`] waits for `serve` to say what became
+/// of it, before it says the link went silent.
+pub const GRACE: Duration = Duration::from_secs(2);
 
 /// How much of what the command writes on stderr the client keeps, the end of it, to explain a
 /// session that did not start, or ended.
@@ -99,6 +127,8 @@ impl Client {
     /// knows the consumer as this machine's. `Command` runs its program with its arguments,
     /// and the line ssh would run there as one last argument; the consumer is completed as for
     /// `Machine`. A command with no program is refused.
+    ///
+    /// A program that only publishes and asks gives a consumer name with no connection.
     pub fn connect(location: BusLocation, consumer: &str) -> Result<Client> {
         let (command, place) = match location {
             BusLocation::Local => {
@@ -118,16 +148,16 @@ impl Client {
 
     /// The consumer's next messages, at most `limit`, as `Bus::pull` returns them; where
     /// `Bus::pull` would return none, it waits until there are some. A `limit` of 0 counts as 1.
-    pub fn pull(&mut self, limit: usize) -> Result<Vec<Delivery>> {
-        let request = Request::GetMessages {
+    pub fn pull(&self, limit: usize) -> Result<Vec<Delivery>> {
+        let call = Call::GetMessages {
             limit: limit.max(1),
         };
         loop {
-            match self.ask(&request)? {
+            match self.call(&call)? {
                 Line::Messages(deliveries) if !deliveries.is_empty() => return Ok(deliveries),
                 // `serve` looks again once it answered: a message published since the pull
                 // brings a notify.
-                Line::Messages(_) => self.wait_for_notify()?,
+                Line::Messages(_) => self.waiters.wait_for_notify()?,
                 line => return Err(unexpected(&line)),
             }
         }
@@ -135,11 +165,77 @@ impl Client {
 
     /// As `Bus::ack`: acknowledges the message at `seq` on `connection`, and every one before
     /// it there. A seq past those the session delivered there is refused.
-    pub fn ack(&mut self, connection: ConnectionId, seq: Seq) -> Result<()> {
-        match self.ask(&Request::Ack { connection, seq })? {
+    pub fn ack(&self, connection: ConnectionId, seq: Seq) -> Result<()> {
+        match self.call(&Call::Ack { connection, seq })? {
             Line::Acked { .. } => Ok(()),
             line => Err(unexpected(&line)),
         }
+    }
+
+    /// As `Bus::publish`: publishes `message` on `output`, and returns its seq.
+    pub fn publish(&self, output: &str, message: &Message) -> Result<Seq> {
+        let call = Call::Publish {
+            output: output.to_owned(),
+            message: message.clone(),
+        };
+        match self.call(&call)? {
+            Line::Published { seq, .. } => Ok(seq),
+            line => Err(unexpected(&line)),
+        }
+    }
+
+    /// As `Bus::request`: asks `message` on `output` as a request, with a deadline `timeout`
+    /// from now by the bus's clock, and waits for its reply or its timeout. It returns by then,
+    /// whatever the link does: when `serve` has said nothing [`GRACE`] past it, it returns
+    /// [`Error::Silent`], and the request may have been taken. Asked again under the same id,
+    /// in this session or another, it is the same request, with its first deadline: asked
+    /// again with a timeout shorter than that deadline leaves, it may return [`Error::Silent`]
+    /// before the bus says what became of it.
+    pub fn request(&self, output: &str, message: &Message, timeout: Duration) -> Result<Outcome> {
+        // None for a timeout too long to wait for anyway.
+        let limit = Instant::now().checked_add(timeout.saturating_add(self.grace));
+        let call = Call::Request {
+            output: output.to_owned(),
+            message: message.clone(),
+            timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+        };
+        let (outcome, came) = mpsc::channel();
+        let answered = self.send(&call, Some(outcome))?;
+        match self.wait(&answered, limit)? {
+            Line::Requested { .. } => {}
+            line => return Err(unexpected(&line)),
+        }
+        match self.wait(&came, limit)? {
+            Line::Reply { data, .. } => Ok(Outcome::Reply(data)),
+            Line::Timeout { taken, .. } => Ok(Outcome::Timeout { taken }),
+            line => Err(unexpected(&line)),
+        }
+    }
+
+    /// As `Bus::take`: takes the request at `seq` before handling it, and says what it found.
+    pub fn take(&self, seq: Seq) -> Result<Take> {
+        match self.call(&Call::Take { seq })? {
+            Line::Taken { state, .. } => Ok(state),
+            line => Err(unexpected(&line)),
+        }
+    }
+
+    /// As `Bus::reply`: replies to the request at `seq`. A request that has a reply keeps the
+    /// first one; one past its deadline that nobody took is refused.
+    pub fn reply(&self, seq: Seq, data: Value) -> Result<()> {
+        match self.call(&Call::Reply { to: seq, data })? {
+            Line::Replied { .. } => Ok(()),
+            line => Err(unexpected(&line)),
+        }
+    }
+
+    /// Ends the session, from any thread: every waiting and later call returns its error.
+    pub fn close(&self) {
+        self.waiters.end(format!(
+            "the session with herdr-bus serve {} was closed",
+            self.place
+        ));
+        self.stop();
     }
 
     /// Runs `command`, which runs `herdr-bus serve`, and waits for its `ready`.
@@ -158,32 +254,20 @@ impl Client {
         else {
             unreachable!("the three are piped");
         };
-        let tail = Arc::new(Mutex::new(Vec::new()));
-        let (read, stderr_read) = mpsc::channel();
-        std::thread::spawn({
-            let tail = Arc::clone(&tail);
-            move || {
-                keep_tail(stderr, &tail);
-                drop(read);
-            }
-        });
-        let mut client = Client {
-            child,
-            to_serve: Some(to_serve),
-            from_serve: BufReader::new(from_serve),
-            stderr: tail,
-            stderr_read,
-            place: place.to_owned(),
-            started: false,
-            ended: None,
-        };
+        let stderr = Stderr::read(stderr);
+        let mut from_serve = BufReader::new(from_serve);
+        let mut line = String::new();
         loop {
-            let line = client.read_line()?;
+            line.clear();
+            if !matches!(from_serve.read_line(&mut line), Ok(read) if read > 0) {
+                drop(to_serve);
+                let _ = child.wait();
+                return Err(Error::Session(
+                    stderr.why(format!("herdr-bus serve did not start {place}")),
+                ));
+            }
             match serde_json::from_str(&line) {
-                Ok(Line::Ready {}) => {
-                    client.started = true;
-                    return Ok(client);
-                }
+                Ok(Line::Ready {}) => break,
                 Ok(line) => {
                     return Err(Error::Session(format!(
                         "herdr-bus serve {place} sent {line:?} first"
@@ -193,93 +277,131 @@ impl Client {
                 Err(_) => {}
             }
         }
+        let waiters = Arc::new(Waiters::default());
+        std::thread::spawn({
+            let waiters = Arc::clone(&waiters);
+            let ended = format!("the session with herdr-bus serve {place} ended");
+            move || reader::read(from_serve, &waiters, || stderr.why(ended))
+        });
+        let (lines, to_write) = mpsc::channel();
+        std::thread::spawn(move || write_lines(to_serve, &to_write));
+        Ok(Client {
+            to_serve: Mutex::new(Some(lines)),
+            waiters,
+            child: Mutex::new(child),
+            place: place.to_owned(),
+            grace: GRACE,
+        })
     }
 
-    /// Waits for `serve` to notify the consumer.
-    fn wait_for_notify(&mut self) -> Result<()> {
-        match self.receive()? {
-            Line::Notify {} => Ok(()),
-            line => Err(unexpected(&line)),
-        }
+    /// Sends `call`, and waits for its answer.
+    fn call(&self, call: &Call) -> Result<Line> {
+        let answered = self.send(call, None)?;
+        self.wait(&answered, None)
     }
 
-    /// Sends `request`, and returns its answer. A notify that comes before it was sent before
-    /// `serve` read the request, which the answer covers: it is dropped.
-    fn ask(&mut self, request: &Request) -> Result<Line> {
-        let line = serde_json::to_string(request).expect("requests serialize");
-        // A write to a `serve` that is gone fails: the session ended.
-        let sent = match self.to_serve.as_mut() {
-            Some(to_serve) => writeln!(to_serve, "{line}")
-                .and_then(|()| to_serve.flush())
-                .is_ok(),
-            None => false,
-        };
-        if !sent {
-            return Err(self.ended());
+    /// Sends `call`, and returns where its answer comes; `outcome`, for a request, is where its
+    /// reply or timeout comes.
+    fn send(&self, call: &Call, outcome: Option<reader::Slot>) -> Result<Receiver<Result<Line>>> {
+        let line = serde_json::to_string(call).expect("calls serialize");
+        let to_serve = lock(&self.to_serve);
+        let answered = self.waiters.expect(outcome)?;
+        // A line the writer cannot take, or cannot write, goes nowhere: `serve` is gone, and
+        // the reader ends the session once it read what `serve` sent, which answers this call
+        // with why.
+        if let Some(lines) = to_serve.as_ref() {
+            let _ = lines.send(line);
         }
-        loop {
-            match self.receive()? {
-                Line::Notify {} => {}
-                Line::Error(error) => return Err(Error::Session(error)),
-                answer => return Ok(answer),
+        Ok(answered)
+    }
+
+    /// Waits for the line `receiver` gets, until `limit` when there is one; an error line is
+    /// returned as an error.
+    fn wait(&self, receiver: &Receiver<Result<Line>>, limit: Option<Instant>) -> Result<Line> {
+        let got = match limit {
+            Some(limit) => {
+                match receiver.recv_timeout(limit.saturating_duration_since(Instant::now())) {
+                    Err(RecvTimeoutError::Timeout) => {
+                        return Err(Error::Silent(self.place.clone()));
+                    }
+                    got => got.map_err(|_| ()),
+                }
             }
+            None => receiver.recv().map_err(|_| ()),
+        };
+        match got {
+            Ok(Ok(Line::Error(error))) => Err(Error::Session(error)),
+            Ok(line) => line,
+            // The reader always answers before it drops a slot.
+            Err(()) => unreachable!("a slot is answered before it goes"),
         }
     }
 
-    fn receive(&mut self) -> Result<Line> {
-        let line = self.read_line()?;
-        serde_json::from_str(&line)
-            .map_err(|error| Error::Session(format!("serve sent {:?}: {error}", line.trim_end())))
-    }
-
-    fn read_line(&mut self) -> Result<String> {
-        let mut line = String::new();
-        let read = self
-            .from_serve
-            .read_line(&mut line)
-            .map_err(|error| Error::Session(format!("cannot read from serve: {error}")))?;
-        if read == 0 {
-            return Err(self.ended());
-        }
-        Ok(line)
+    /// Ends the command, without waiting for a dead link to time out: the writer's pipe breaks,
+    /// and it stops.
+    fn stop(&self) {
+        drop(lock(&self.to_serve).take());
+        let mut child = lock(&self.child);
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
-impl Client {
-    /// The error of a session that ended: where, and what the command wrote on stderr, read
-    /// once it is over. Every call after the end gives the same.
-    fn ended(&mut self) -> Error {
-        if self.ended.is_none() {
-            drop(self.to_serve.take());
-            let _ = self.child.wait();
-            // Ends with the thread, or times out: nothing is ever sent.
-            let _ = self.stderr_read.recv_timeout(STDERR_GRACE);
-            let wrote = self
-                .stderr
-                .lock()
-                .map(|tail| String::from_utf8_lossy(&tail).into_owned())
-                .unwrap_or_default();
-            let what = if self.started {
-                format!("the session with herdr-bus serve {} ended", self.place)
-            } else {
-                format!("herdr-bus serve did not start {}", self.place)
-            };
-            self.ended = Some(match wrote.trim() {
-                "" => what,
-                wrote => format!("{what}: {wrote}"),
-            });
+/// Writes each line of `lines` on `serve`'s stdin, until the client stops or the pipe breaks.
+fn write_lines(mut to_serve: ChildStdin, lines: &Receiver<String>) {
+    for line in lines {
+        if writeln!(to_serve, "{line}")
+            .and_then(|()| to_serve.flush())
+            .is_err()
+        {
+            return;
         }
-        Error::Session(self.ended.clone().unwrap_or_default())
     }
 }
 
 impl Drop for Client {
-    /// Closes the pipe to `serve` and ends the command, without waiting for a dead link to
-    /// time out: cursors are in the bus file, so nothing is lost.
+    /// Ends the command: cursors and requests are in the bus file, so nothing is lost.
     fn drop(&mut self) {
-        drop(self.to_serve.take());
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop();
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What the command writes on stderr, which a thread reads for the whole session, so that a
+/// full pipe never blocks it: read once the session ended, to say why.
+struct Stderr {
+    /// The end of it.
+    tail: Arc<Mutex<Vec<u8>>>,
+    /// Closed once the thread read all of it.
+    read: Receiver<()>,
+}
+
+impl Stderr {
+    fn read(stderr: ChildStderr) -> Self {
+        let tail = Arc::new(Mutex::new(Vec::new()));
+        let (done, read) = mpsc::channel();
+        std::thread::spawn({
+            let tail = Arc::clone(&tail);
+            move || {
+                keep_tail(stderr, &tail);
+                drop(done);
+            }
+        });
+        Self { tail, read }
+    }
+
+    /// `what` happened to the session, and what the command wrote on stderr, once it ended.
+    fn why(&self, what: String) -> String {
+        // Ends with the thread, or times out: nothing is ever sent.
+        let _ = self.read.recv_timeout(STDERR_GRACE);
+        let wrote = String::from_utf8_lossy(&lock(&self.tail)).into_owned();
+        match wrote.trim() {
+            "" => what,
+            wrote => format!("{what}: {wrote}"),
+        }
     }
 }
 
@@ -290,7 +412,7 @@ fn keep_tail(mut stderr: ChildStderr, tail: &Mutex<Vec<u8>>) {
         if read == 0 {
             break;
         }
-        let Ok(mut kept) = tail.lock() else { return };
+        let mut kept = lock(tail);
         kept.extend_from_slice(&chunk[..read]);
         if kept.len() > STDERR_TAIL {
             let excess = kept.len() - STDERR_TAIL;

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::connections::output_of;
 use crate::messages::{SELECT, limit as sql_limit, stored};
-use crate::{Bus, ConnectionId, Error, Message, Result, Seq, TAP};
+use crate::{Bus, ConnectionId, Error, Message, Request, RequestState, Result, Seq, TAP};
 
 /// A message a pull returned, and the connection it came through: acknowledge it with both.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -16,6 +16,9 @@ pub struct Delivery {
     /// The output it was published on: a tap reads several.
     pub output: String,
     pub message: Message,
+    /// Where it stands as a request, when it is one: take it before handling it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<RequestState>,
 }
 
 impl Bus {
@@ -40,9 +43,11 @@ impl Bus {
                 })?
                 .collect::<rusqlite::Result<Vec<(ConnectionId, String, i64)>>>()?;
             let mut deliveries = Vec::new();
-            let mut tap = tx.prepare(&format!("{SELECT} WHERE seq > ?1 ORDER BY seq LIMIT ?2"))?;
+            let mut tap = tx.prepare(&format!(
+                "{SELECT} WHERE m.seq > ?1 ORDER BY m.seq LIMIT ?2"
+            ))?;
             let mut one = tx.prepare(&format!(
-                "{SELECT} WHERE output = ?3 AND seq > ?1 ORDER BY seq LIMIT ?2"
+                "{SELECT} WHERE m.output = ?3 AND m.seq > ?1 ORDER BY m.seq LIMIT ?2"
             ))?;
             for (connection, output, cursor) in connections {
                 let left = sql_limit(limit - deliveries.len());
@@ -61,6 +66,7 @@ impl Bus {
                     seq: stored.seq,
                     output: stored.output,
                     message: stored.message,
+                    request: stored.request.as_ref().map(Request::state),
                 }));
             }
             Ok(deliveries)

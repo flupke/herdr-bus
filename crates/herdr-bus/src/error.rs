@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use uuid::Uuid;
+
 use crate::{ConnectionId, Seq};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -38,6 +40,14 @@ pub enum Error {
     NotOnConnection { connection: ConnectionId, seq: Seq },
     #[error("no message {0}")]
     UnknownMessage(Seq),
+    #[error("message {0} is no request")]
+    NotARequest(Seq),
+    /// A request asked again under the id of a plain message.
+    #[error("{output} holds {id} already, as a plain message, not a request")]
+    PlainMessage { output: String, id: Uuid },
+    /// A reply to a request past its deadline that nobody took: its asker gave up on it.
+    #[error("request {0} expired: its deadline passed and nobody took it")]
+    Expired(Seq),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
 }

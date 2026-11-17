@@ -53,7 +53,26 @@ with the consumer (Sessions).
   messages and without its connections.
 - **Session**: a consumer's link to `herdr-bus serve <consumer>`, one JSON
   line each way over the command's stdin and stdout. It tells the consumer
-  when it has messages, sends them only when asked, and takes its acks.
+  when it has messages, sends them only when asked, and takes its acks. It
+  also publishes, and asks, takes and replies to requests, for a program on
+  that machine or another.
+- **Request**: a message published with a deadline, which takes one reply.
+  It is a message of its output like any other: consumers pull and ack it,
+  a tap sees it. Its deadline is set once, when it is first asked: the time
+  of the bus's machine plus the asker's timeout. Asking again under the same
+  `(output, id)` is the same request: its seq, its deadline, its reply.
+- **Reply**: the one answer to a request, free JSON, kept with the request
+  in the bus it was asked on. It is no message: no output carries it, and no
+  tap receives it. The first reply stands. It is matched to its request by
+  the request's seq, and read where the request was asked, by an asker on
+  another machine through the session it asked through: it travels nowhere.
+- **Take**: what the consumer that answers a request does before it works
+  on it, in one write. A request past its deadline that nobody took cannot
+  be taken, judged by the clock of the bus's machine in that write, never by
+  the consumer's: a request its asker gave up on is never handled later.
+  The bus does not record who took a request: one program answers the
+  requests of an output, and a second take, `taken_before`, is its own
+  before a crash.
 
 Producers don't know their consumers. Connecting later and replaying
 history works because messages are kept.
@@ -62,8 +81,12 @@ Delivery is at-least-once: a consumer that crashes after handling a
 message but before acknowledging it sees it again. Consumers are
 idempotent on the message `id`.
 
-The bus has two consumer operations, `pull` and `ack`, and no failure
-handling. A message the consumer doesn't ack comes back on its next
+A request delivered again stays one request: a consumer that took it before
+a crash is told so by its next `take`, and dedupes on the message `id` in its
+own store; one replied to is told it has its reply.
+
+The bus has two consumer operations on messages, `pull` and `ack`, two on
+requests, `take` and `reply`, and no failure handling. A message the consumer doesn't ack comes back on its next
 `pull`. A consumer that can't handle a message decides what to do with it:
 ack it to skip it, or leave it unacked to stop there.
 
@@ -113,6 +136,15 @@ CREATE TABLE connections (
   created  TEXT NOT NULL,
   UNIQUE (consumer, output)
 );
+
+-- Migration 2.
+CREATE TABLE requests (
+  seq      INTEGER PRIMARY KEY REFERENCES messages(seq),
+  deadline TEXT NOT NULL,                -- RFC 3339, by the clock of the bus's machine
+  taken    TEXT,                         -- RFC 3339 when a consumer took it, else NULL
+  reply    TEXT,                         -- the reply's data, JSON; NULL until replied
+  replied  TEXT                          -- RFC 3339 when replied, else NULL
+);
 ```
 
 The bus id's row is made once, in the transaction that creates the
@@ -135,7 +167,8 @@ CloudEvents-shaped, as stored in `messages`:
 
 `data` is free per type. Producers document their types in their
 output's `types`. Consumers ignore types they don't handle (and `ack`
-them).
+them). As JSON, in a session's lines, only `type` and `data` are required:
+without an `id`, the bus generates one, and without a `time`, it is now.
 
 ## Library API (Rust)
 
@@ -165,6 +198,22 @@ for d in bus.pull("inbox", 50)? {
     bus.ack(d.connection, d.seq)?;
 }
 
+// Request and reply. The asker: a request is published as `publish` does, with a
+// deadline `timeout` from now by this machine's clock; the same id again is the
+// same request. `outcome` reads what became of it: `Pending { deadline }`,
+// `Replied(Reply { data, replied })`, or `TimedOut { taken }` once the deadline
+// passed with no reply. The library does not wait: a session or the command does.
+let seq = bus.request("asks", &Message::new("app.question", data).id(uuid), timeout)?;
+bus.outcome(seq)?;
+
+// The consumer that answers: take before the work, then reply, then ack.
+match bus.take(d.seq)? {
+    Take::Taken => { bus.reply(d.seq, answer)?; }
+    Take::TakenBefore => { /* taken before a crash: dedupe on d.message.id */ }
+    Take::Replied | Take::Expired => {}
+}
+bus.ack(d.connection, d.seq)?;
+
 // Wiring and inspection (used by the CLI and therefore herdr-patch).
 bus.disconnect(connection_id)?;
 bus.set_enabled(connection_id, false)?;
@@ -179,7 +228,7 @@ bus.positions("inbox")?;              // each enabled connection's cursor and ne
 // `herdr-bus-client` crate starts with `herdr-bus` from PATH, or with a login
 // shell's PATH on another machine: over ssh for a machine of `hc machine ls`,
 // or through a command the app gives that reaches the machine.
-let mut client = Client::connect(BusLocation::Local, "inbox")?;
+let client = Client::connect(BusLocation::Local, "inbox")?;
 // or Client::connect(BusLocation::Machine("box".into()), "inbox")
 // or Client::connect(BusLocation::Command(via), "inbox"), `via` a command that
 // reaches the machine: ["fly", "ssh", "console", "-a", "app", "--pty=false", "-C"]
@@ -189,13 +238,27 @@ loop {
         client.ack(d.connection, d.seq)?;
     }
 }
+// Through the session, on its machine's bus: every method takes &self, and other
+// threads call these while one waits in pull.
+client.publish("events", &message)?;
+match client.request("asks", &message, timeout)? {   // waits for the reply
+    Outcome::Reply(data) => {}
+    Outcome::Timeout { taken } => {}              // taken: false, nobody ever handles it
+}
+client.take(seq)?;
+client.reply(seq, data)?;
+client.close();                       // from any thread: every call returns an error
 ```
 
 The library's public types: `Bus`, `Output` (what a program declares),
-`Declared` (an output as the bus holds it), `Message`, `Link`, `Stored`,
-`MessageQuery`, `Delivery { connection, seq, output, message }`,
+`Declared` (an output as the bus holds it), `Message`, `Link`,
+`Stored { seq, output, published, message, request }`, `MessageQuery`,
+`Delivery { connection, seq, output, message, request }`,
 `Connection { id, consumer, output, enabled, cursor, lag, created }`,
-`Position`, `Start`, `TAP`, `Seq`, `ConnectionId`, `Error`, `Result`,
+`Position`, `Start`, `TAP`, `Seq`, `ConnectionId`,
+`Request { deadline, taken, reply }` (a request as the bus holds it),
+`Reply { data, replied }`, `RequestState { deadline, taken, replied }` (what
+a delivery says of a request), `Take`, `Outcome`, `Error`, `Result`,
 `Timestamp`, `Uuid` and `DB_VARIABLE`. Every `consumer` argument takes a
 bare or full name, which the bus completes.
 
@@ -218,11 +281,39 @@ Rules:
   (`output = name`), in one write; taps stay. `publish`, `connect` and
   `delete` refuse a deleted output, and `outputs` leaves it out. `declare`
   brings it back.
+- `request` publishes as `publish` does, with the same refusals, and writes
+  the deadline in the same transaction. An id the output holds as a request
+  returns its seq, and its first deadline stays; an id it holds as a plain
+  message is refused. A timeout of 0 expires at once.
+- `take(seq)` answers, in one write: `Taken`, the first take before the
+  deadline; `TakenBefore`, taken already, as after a crash; `Replied`, it
+  has its reply; `Expired`, past its deadline and never taken, which the
+  consumer acks and skips. A deadline has passed once the clock reaches it.
+- `reply(seq, data)` returns the reply that stands: the first, when there is
+  one already. A request never taken is taken in the same write; one past its
+  deadline and never taken is refused. A request taken is replied to even
+  past its deadline, so that the same id asked again returns the reply.
+- `outcome(seq)` is `TimedOut` only once the deadline has passed with no
+  reply, read under the write lock, so that a take that read the clock
+  before the deadline has committed: `TimedOut { taken: false }` is final.
+- `take`, `reply` and `outcome` refuse a seq that is no request.
 - Writes run in short `BEGIN IMMEDIATE` transactions.
 - `herdr_bus_client::Client::pull` returns what `Bus::pull` would, and
   where that is nothing, waits for a notify and asks again. Once the
-  session ends, `pull` and `ack` return an error: the caller connects
-  again, and the new session's first pull returns at once what waited.
+  session ends, every waiting and later call returns an error: the caller
+  connects again, and the new session's first pull returns at once what
+  waited, and a request asked again under its id is the same request.
+- Every method of `Client` takes `&self`, and `Client` is `Send + Sync`: one
+  thread waits in `pull` while others publish, ask, take, reply and ack, and
+  several wait in `request` at once. One thread reads what `serve` sends and
+  hands it on: answers in the order the lines were sent, a reply or timeout
+  by its seq, a notify to the waiting pull. Another writes the lines, so
+  that no call blocks on a link that stopped reading. `close()`, from any
+  thread, ends the session.
+- `Client::request` returns by its deadline whatever the link does: when
+  `serve` has said nothing `GRACE` (2 s) past it, it returns `Error::Silent`,
+  and the request may have been taken. An older `serve` answers a line it
+  does not know with an error, which the client returns as it is.
 - `Client::connect` with `Machine(name)` reads `hc machine ls --json`
   (`{"machines": [{"name", "target", "via", "state", …}]}`), and runs
   `ssh -o BatchMode=yes -o ControlMaster=no -o ConnectTimeout=15
@@ -252,12 +343,17 @@ Rules:
 Crate `herdr-bus-cli`, binary `herdr-bus`, apart from the library so that
 an app linking the library builds none of it. Every command takes
 `--json` (machine output, one JSON document on stdout) and `--db <path>`.
-Errors: exit 1, `{"error": "…"}` on stdout in `--json` mode.
+Errors: exit 1, `{"error": "…"}` on stdout in `--json` mode. A request
+whose deadline passed with no reply: exit 2.
 
 ```
 herdr-bus declare <output> [--description …] [--types a,b]
 herdr-bus publish <output> --type … [--id UUID] [--subject …] [--time …] [--link LABEL=URL …]
                   [--data JSON | stdin]
+herdr-bus request <output> --type … --timeout 5s [--id UUID] [--subject …] [--time …]
+                  [--link LABEL=URL …] [--data JSON | stdin]
+herdr-bus take <seq>
+herdr-bus reply <seq> [--data JSON | stdin]
 herdr-bus connect <consumer> <output>|'*' [--from now|beginning]
 herdr-bus pull <consumer> [--limit N]
 herdr-bus ack <connection> <seq>
@@ -277,9 +373,22 @@ herdr-bus skill                              # a SKILL.md that teaches an agent 
 `{"connection": 3, "seq": 43, "output": "events", "message": {<envelope>}}`,
 the envelope as in Message envelope (`id`, `type`, `subject`, `time`,
 `data`, `links`); `[]` when there is nothing.
+A delivery of a request also carries `"request": {"deadline": "…", "taken":
+bool, "replied": bool}`; a plain message's has no `request` key.
 `publish --json` prints `{"seq": 43, "id": "<uuid>"}`, the id given or generated.
+`request` asks, then waits in its own process on the bus's machine, with no
+`serve`, watching the file from before it publishes: it prints the reply's
+data and exits 0, or, once the deadline passed with no reply, exits 2 and
+says on stderr whether the request was taken. `--timeout` takes a duration
+such as `500ms`, `5s` or `10m`. With `--json`: `{"seq", "id", "reply":
+<data>}`, or `{"seq", "id", "timeout": {"taken": bool}}`. `take` prints the
+state, `taken`, `taken_before`, `replied` or `expired`, all exit 0;
+`--json`: `{"seq", "state"}`. `reply --json` prints `{"seq", "replied":
+"<time>"}`, the time of the reply that stands.
 `messages` and `message` print `{"seq", "output", "published",
-"message"}`; `declare` and `outputs` the output: `name`, `description`,
+"message"}`, and on a request `"request": {"deadline", "taken": "<time>" |
+null, "reply": {"data", "replied"} | null}`; `declare` and `outputs` the
+output: `name`, `description`,
 `types`, `declared`, `last_seen`, and its `connections`, those on it by
 name (a tap shows in `connections` only);
 `connect`, `ack`, `enable`, `disable` and `connections` the connection:
@@ -329,6 +438,12 @@ Consumer → `serve`:
 - `{"get_messages": {"limit": 10}}`: at most `limit` messages, as `pull`
   returns them. A `limit` of 0 is refused.
 - `{"ack": {"connection": 3, "seq": 43}}`: as `ack`.
+- `{"publish": {"output": "events", "message": {…}}}`: as `publish`.
+  `message` is the envelope, of which only `type` and `data` are required.
+- `{"request": {"output": "asks", "message": {…}, "timeout_ms": 5000}}`: as
+  `request`. Its outcome comes later, unasked.
+- `{"take": {"seq": 44}}`: as `take`.
+- `{"reply": {"to": 44, "data": …}}`: as `reply`.
 
 `serve` → consumer:
 
@@ -337,8 +452,19 @@ Consumer → `serve`:
 - `{"messages": [<delivery>, …]}`: the answer to `get_messages`, deliveries
   in `pull --json`'s shape, `[]` when there are none.
 - `{"acked": {"connection": 3, "seq": 43}}`: the answer to `ack`.
-- `{"error": "…"}`: the answer to a request `serve` cannot carry out, or to a
-  line that is no request; the session goes on. An ack of a seq past the
+- `{"published": {"seq": 43, "id": "…"}}`: the answer to `publish`, the id
+  given or generated.
+- `{"requested": {"seq": 44, "id": "…"}}`: the answer to `request`, at once.
+- `{"reply": {"to": 44, "id": "…", "data": …}}` or `{"timeout": {"to": 44,
+  "id": "…", "taken": false}}`: later, exactly one of the two for each
+  `request` line the session answered, unasked. `timeout` comes once the
+  deadline has passed with no reply, by `Bus::outcome`: `taken: false`
+  guarantees that the request is never handled.
+- `{"taken": {"seq": 44, "state": "taken"}}`: the answer to `take`, the
+  state one of `taken`, `taken_before`, `replied` and `expired`.
+- `{"replied": {"to": 44}}`: the answer to `reply`.
+- `{"error": "…"}`: the answer to a line `serve` cannot carry out, or does
+  not know; the session goes on. An ack of a seq past the
   highest the session delivered on that connection is refused: the consumer
   cannot have handled it.
 
@@ -346,16 +472,26 @@ A consumer with no connection, or whose connections went with their
 output, has no messages to give: `[]`. An ack on a connection removed since
 its messages were delivered is `acked`: it has nothing left to move.
 
-Each request gets exactly one answer, in the order sent; notifies come in
-between. `serve` sends no message unasked: the consumer's `limit` is its
-backpressure. Cursors stay in the file: a session that breaks off loses
-nothing, and what the consumer did not acknowledge comes back in the next.
+Each line the consumer sends gets exactly one answer, in the order sent.
+Notifies, and the `reply` or `timeout` of each request, come in between.
+Several requests wait at once on one session, and their replies come in any
+order. `serve` sends no message unasked: the consumer's `limit` is its
+backpressure. Cursors and requests stay in the file: a session that breaks
+off loses nothing. What the consumer did not acknowledge comes back in the
+next, and a request asked there again under its id is the same request.
+
+A program that only publishes and asks, and reads no output, holds its
+session under a consumer name with no connection: `serve` checks the
+name's shape alone, and such a consumer has no messages. Lines have no cap
+on their size: requests and replies reach a few hundred KB.
 
 `serve` learns of writes by watching the file's folder: every write
 modifies the `-wal` file, and no read does. The modification comes before
 the write can be read, so it looks at the file 30 ms after it, and once a
 second without one, as a backstop. Where it cannot watch the folder, it
-says so on stderr and looks once a second.
+says so on stderr and looks once a second. It also wakes at the nearest
+deadline of the requests it waits on, and looks for their replies where it
+looks for new messages. `herdr-bus request` waits the same way.
 
 ## Shared types
 
@@ -370,8 +506,8 @@ crate of its own beside the bus, which the bus crate does not depend on.
 
 ## Retention
 
-History is kept forever in v1: nothing deletes messages or
-connections' past, a deleted output's messages included. Pruning is
+History is kept forever in v1: nothing deletes messages, requests and
+their replies, or connections' past, a deleted output's messages included. Pruning is
 added later if the file grows enough to
 matter; when it is, a message must only go once every connection that
 reads it, taps included, has a cursor past it.
@@ -411,14 +547,16 @@ Later, not v1: a canvas with draggable nodes and wires (`paint_path`).
 - Filters on connections (producers decide what goes on an output).
 - Remote machines in the bus (one local SQLite file per machine). A
   program writes another machine's bus by running the CLI there, through
-  `hc exec --on <machine> herdr-bus …`, and reads it through a session
-  there, over ssh or a command that reaches the machine, as `<name>@<its
-  own machine id>`. The bus checks a consumer's
+  `hc exec --on <machine> herdr-bus …`, or through a session there, and
+  reads it, and asks there, through a session there, over ssh or a command
+  that reaches the machine, as `<name>@<its own machine id>`. The bus checks a consumer's
   name only for its shape: it never asks whether that machine exists.
 - `pull --wait`, or a `wait` command: a consumer that waits holds a
   session.
-- `publish` or request/reply in a session: a program writes on its own
-  machine's bus. Both can be added as new lines later.
+- Identity in requests: the bus carries no sender. A program that must
+  know who asks signs its requests itself.
+- Replies as messages, or delivered to taps; cancelling a request; and
+  telling a consumer that is down from a slow one: both are a timeout.
 - Access control between programs, and registering consumers: a
   consumer is known by its connections alone.
 - Deleting history (no `prune`; see Retention).

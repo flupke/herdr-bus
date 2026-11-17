@@ -18,3 +18,19 @@ fn the_remote_line_passes_the_consumer_through_two_shells() {
         );
     }
 }
+
+/// A link that went silent, that reads nothing and says nothing after `ready`, does not hold a
+/// request past its deadline and the grace, a request too large for the pipe included, nor
+/// the calls after it.
+#[test]
+fn a_request_on_a_silent_link_returns_by_its_deadline() {
+    let mut silent = Command::new("sh");
+    silent.args(["-c", r#"echo '{"ready":{}}'; exec sleep 600"#]);
+    let mut client = Client::start(silent, "here").unwrap();
+    client.grace = Duration::ZERO;
+    let large = Message::new("t", serde_json::json!("x".repeat(512 * 1024)));
+    for message in [large, Message::new("t", serde_json::json!(1))] {
+        let asked = client.request("asks", &message, Duration::ZERO);
+        assert!(matches!(asked, Err(Error::Silent(_))), "{asked:?}");
+    }
+}

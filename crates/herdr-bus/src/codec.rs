@@ -31,3 +31,15 @@ pub(crate) fn json<T: DeserializeOwned>(row: &Row<'_>, column: usize) -> rusqlit
 pub(crate) fn to_json(value: &impl Serialize) -> String {
     serde_json::to_string(value).expect("a JSON value, a string list or links serialize")
 }
+
+/// A nullable TEXT column that parses, as [`parsed`] does.
+pub(crate) fn parsed_or_null<T>(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<T>>
+where
+    T: FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    match row.get_ref(column)? {
+        rusqlite::types::ValueRef::Null => Ok(None),
+        _ => parsed(row, column).map(Some),
+    }
+}

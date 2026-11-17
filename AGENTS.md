@@ -47,9 +47,9 @@ on a private bus file, never the user's: see [Checking from a shell](.agents/wik
 
 A change to the skill (`crates/herdr-bus-cli/SKILL.md`) is tested by a fresh subagent that knows
 only `herdr-bus skill` and the commands' `--help`: on a private bus file, it builds a producer, a
-consumer and a tap, says which consumer name a script of this machine gives to read another
-machine's bus, and reports where the skill left it unsure. Fix the skill until it reports
-nothing that matters.
+consumer, a tap, an asker and an answerer, says which consumer name a script of this machine
+gives to read another machine's bus, and reports where the skill left it unsure. Fix the skill
+until it reports nothing that matters.
 
 A change to docs alone is tested by searching README.md, AGENTS.md, CONTEXT.md, SPEC.md,
 CODING_STANDARDS.md, the ADRs, the wiki and the crates' doc comments for each statement of what

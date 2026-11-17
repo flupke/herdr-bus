@@ -50,6 +50,27 @@ The checks the user runs, each with what it must show:
    shows it, `$b publish out …` fails, a tap still pulls its messages, and `$b declare out`
    brings it back, with its messages and without its connections.
 
+10. Ask and answer: `$b declare asks` and `$b connect answerer asks`, then `$b request asks
+    --type t --timeout 10s --data '{}'` blocks in one terminal. In another, `$b pull answerer
+    --json` shows it with `"request": {"deadline": …, "taken": false, "replied": false}`; `$b
+    take <seq>` prints `taken`, and `$b reply <seq> --data '{"ok":true}'` makes the first
+    terminal print `{"ok":true}` and exit 0. The same `--id` asked again prints it at once, a
+    second `reply` leaves it, and `take` prints `replied`.
+11. Nobody answers: `$b request asks --type t --timeout 2s --data '{}'` with no consumer exits
+    2 after two seconds and says `not taken` on stderr; `$b take <seq>` then prints `expired`,
+    and `$b reply <seq>` fails. A request taken and never replied exits 2 and says `taken`. A
+    consumer killed after its `take` and before its `ack` pulls the request again, marked
+    `"taken": true`, and `take` prints `taken_before`.
+12. A session asks and answers: in `$b serve asker`, typed `{"request": {"output": "asks",
+    "message": {"type": "t", "data": 1}, "timeout_ms": 60000}}` lines, three of them, each get
+    `requested` at once; `take` and `reply` lines in `$b serve answerer`, in any order, bring
+    each `reply` line to the asker's session as it is given, naming its request by `to`, while
+    a `get_messages` there is still answered. A `publish` line puts a message on the bus. A
+    `timeout_ms` of 0 brings `timeout` with `"taken": false`. The same through `ssh localhost`.
+13. An older bus file: a file made by the fixed point's binary (`cargo install … --rev <fixed
+    point>`, as below), with messages, opens with the change's binary, which migrates it, and
+    keeps its messages.
+
 A change that must leave the command's output as it was runs that script with a binary of the
 fixed point too (`cargo install --git file://… --rev <fixed point> --root <folder>
 herdr-bus-cli`), and `diff`s it with the change's.

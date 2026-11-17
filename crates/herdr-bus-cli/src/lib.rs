@@ -1,13 +1,16 @@
 //! The `herdr-bus` command: every operation of the library, for programs that cannot link it
 //! and for people at a shell. With `--json`, it prints one JSON document on stdout, and an
-//! error as `{"error": "…"}` there; its exit code is 1 on any error. `serve` instead holds a session
-//! with a consumer, in JSON lines over stdin and stdout.
+//! error as `{"error": "…"}` there; its exit code is 1 on any error, and 2 when a request's
+//! deadline passes with no reply. `serve` instead holds a session with a consumer, in JSON
+//! lines over stdin and stdout.
 //!
 //! [`run`] is the whole command, which the `herdr-bus` binary only calls. An app that links this
 //! crate can run as `herdr-bus` too: it calls `run` when it is invoked through a symbolic link
 //! of that name, and ships one binary, with the command at the revision it links.
 
+mod ask;
 mod serve;
+mod watch;
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -17,10 +20,10 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use herdr_bus::{
-    Bus, Connection, ConnectionId, Declared, Delivery, Message, MessageQuery, Output, Seq, Start,
-    Stored, Uuid,
+    Bus, Connection, ConnectionId, Declared, Delivery, Message, MessageQuery, Outcome, Output, Seq,
+    Start, Stored, Uuid,
 };
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -62,6 +65,22 @@ enum Command {
     },
     /// Publish a message on an output, and print its seq.
     Publish(Publish),
+    /// Ask a request on an output, and wait for its reply: print the reply's data, or exit 2
+    /// once its deadline passed with no reply, saying whether a consumer took it.
+    Request(Ask),
+    #[command(
+        about = "Take a request before handling it, and print what it found: taken, \
+                 taken_before (taken already, after a crash say), replied, or expired (past its \
+                 deadline: ack it and skip it)"
+    )]
+    Take { seq: Seq },
+    /// Reply to a request, taking it if nobody did; the first reply stands.
+    Reply {
+        seq: Seq,
+        /// The reply's data, as JSON [default: read from stdin]
+        #[arg(long)]
+        data: Option<String>,
+    },
     /// Connect a consumer to an output, or to every output with '*' (a tap).
     Connect {
         /// `<name>`, a consumer of this machine, or `<name>@<machine id>`.
@@ -147,6 +166,17 @@ struct Publish {
     links: Vec<(String, String)>,
 }
 
+#[derive(Args)]
+struct Ask {
+    #[command(flatten)]
+    message: Publish,
+    /// How long to wait for the reply, such as 500ms, 5s or 10m: the request's deadline, by
+    /// the bus's clock, is now plus this. Asked again under the same --id, it keeps its first
+    /// deadline.
+    #[arg(long, value_name = "DURATION")]
+    timeout: SignedDuration,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum From {
     Now,
@@ -160,15 +190,47 @@ struct Published {
     id: Uuid,
 }
 
+/// What `request` prints: its seq and id, then the reply's data or the timeout.
+#[derive(Serialize)]
+struct Asked {
+    seq: Seq,
+    id: Uuid,
+    #[serde(flatten)]
+    outcome: Fate,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Fate {
+    Reply(Value),
+    Timeout { taken: bool },
+}
+
+/// What `take` prints.
+#[derive(Serialize)]
+struct Took {
+    seq: Seq,
+    state: herdr_bus::Take,
+}
+
+/// What `reply` prints: the time of the reply that stands.
+#[derive(Serialize)]
+struct Replied {
+    seq: Seq,
+    replied: Timestamp,
+}
+
 /// What a command prints: its JSON document, its fields in their documented order, or lines
 /// for people.
 struct Report {
     json: String,
     text: String,
+    /// A request's deadline passed with no reply: exit 2, the lines for people on stderr.
+    timed_out: bool,
 }
 
 /// What a command did: its report, or nothing for `serve`, which wrote its session already.
-type Outcome = Result<Option<Report>, String>;
+type Done = Result<Option<Report>, String>;
 
 /// Runs the `herdr-bus` command with `args`, as `herdr-bus` with these arguments would: it reads
 /// stdin, prints on stdout and stderr, and returns the command's exit code. `args` starts with
@@ -194,9 +256,20 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString>>) -> ExitCode {
         }
         Err(error) => Err(error.render().to_string()),
     };
-    let printed = match &outcome {
+    match print(&outcome, json) {
+        // A reader that closes the pipe early has what it wanted.
+        Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => ExitCode::FAILURE,
+        _ => exit_code(&outcome),
+    }
+}
+
+/// Prints what the command did: its JSON, or lines for people, on stdout, or on stderr for an
+/// error or a timeout.
+fn print(outcome: &Done, json: bool) -> std::io::Result<()> {
+    match outcome {
         Ok(None) => Ok(()),
         Ok(Some(report)) if json => writeln!(std::io::stdout(), "{}", report.json),
+        Ok(Some(report)) if report.timed_out => write!(std::io::stderr(), "{}", report.text),
         Ok(Some(report)) => write!(std::io::stdout(), "{}", report.text),
         Err(error) => {
             let error = error.trim_start_matches("error: ").trim_end();
@@ -206,16 +279,21 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString>>) -> ExitCode {
                 writeln!(std::io::stderr(), "herdr-bus: {error}")
             }
         }
-    };
-    match printed {
-        // A reader that closes the pipe early has what it wanted.
-        Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => ExitCode::FAILURE,
-        _ if outcome.is_err() => ExitCode::FAILURE,
-        _ => ExitCode::SUCCESS,
     }
 }
 
-fn execute(cli: Cli) -> Outcome {
+/// 1 on an error, 2 when a request's deadline passed with no reply.
+fn exit_code(outcome: &Done) -> ExitCode {
+    match outcome {
+        Err(_) => ExitCode::FAILURE,
+        Ok(Some(Report {
+            timed_out: true, ..
+        })) => ExitCode::from(2),
+        Ok(_) => ExitCode::SUCCESS,
+    }
+}
+
+fn execute(cli: Cli) -> Done {
     // It needs no bus file, and creates none.
     if let Command::Skill = cli.command {
         return Ok(Some(Report::new(
@@ -234,6 +312,7 @@ fn execute(cli: Cli) -> Outcome {
                 .map(|()| None)
                 .map_err(|error| error.to_string());
         }
+        Command::Request(ask) => ask_report(&bus, &path, ask),
         Command::Id => Ok(Report::new(
             &json!({ "id": bus.id() }),
             format!("{}\n", bus.id()),
@@ -243,7 +322,9 @@ fn execute(cli: Cli) -> Outcome {
         | Command::Pull { .. }
         | Command::Ack { .. }
         | Command::Message { .. }
-        | Command::Messages { .. } => run_log(&bus, cli.command),
+        | Command::Messages { .. }
+        | Command::Take { .. }
+        | Command::Reply { .. } => run_log(&bus, cli.command),
         Command::Outputs => outputs_report(&bus),
         Command::Delete { output } => delete_report(&bus, &output),
         _ => run_connections(&bus, cli.command),
@@ -270,6 +351,20 @@ fn run_log(bus: &Bus, command: Command) -> Result<Report, Box<dyn std::error::Er
                     id: message.id,
                 },
                 format!("{seq}\t{}\n", message.id),
+            )
+        }
+        Command::Take { seq } => {
+            let state = bus.take(seq)?;
+            Report::new(&Took { seq, state }, format!("{state}\n"))
+        }
+        Command::Reply { seq, data } => {
+            let reply = bus.reply(seq, read_data(data)?)?;
+            Report::new(
+                &Replied {
+                    seq,
+                    replied: reply.replied,
+                },
+                format!("{seq}\t{}\n", reply.replied),
             )
         }
         Command::Pull { consumer, limit } => pull_report(&bus.pull(&consumer, limit)?),
@@ -351,22 +446,65 @@ fn run_connections(bus: &Bus, command: Command) -> Result<Report, Box<dyn std::e
     })
 }
 
+/// Asks a request and waits for its outcome, in this process: exit 2 on a timeout.
+fn ask_report(
+    bus: &Bus,
+    path: &std::path::Path,
+    ask: Ask,
+) -> Result<Report, Box<dyn std::error::Error>> {
+    let timeout = std::time::Duration::try_from(ask.timeout)
+        .map_err(|_| format!("--timeout {} is negative", ask.timeout))?;
+    let output = ask.message.output.clone();
+    let message = ask.message.message()?;
+    let id = message.id;
+    let (seq, outcome) = ask::ask(bus, path, &output, &message, timeout)?;
+    Ok(match outcome {
+        Outcome::Replied(reply) => {
+            let text = format!("{}\n", reply.data);
+            let outcome = Fate::Reply(reply.data);
+            Report::new(&Asked { seq, id, outcome }, text)
+        }
+        Outcome::TimedOut { taken } => {
+            let said = if taken {
+                "taken: a consumer took it, and may still handle it"
+            } else {
+                "not taken: nobody will handle it"
+            };
+            Report {
+                timed_out: true,
+                ..Report::new(
+                    &Asked {
+                        seq,
+                        id,
+                        outcome: Fate::Timeout { taken },
+                    },
+                    format!("herdr-bus: request {seq} timed out, {said}\n"),
+                )
+            }
+        }
+        Outcome::Pending { .. } => unreachable!("ask waits until the request has an outcome"),
+    })
+}
+
+/// The data `--data` gives, or else stdin, as JSON.
+fn read_data(data: Option<String>) -> Result<Value, Box<dyn std::error::Error>> {
+    let data = match data {
+        Some(data) => data,
+        None if std::io::stdin().is_terminal() => {
+            return Err("give the data with --data, or as JSON on stdin".into());
+        }
+        None => {
+            let mut data = String::new();
+            std::io::stdin().read_to_string(&mut data)?;
+            data
+        }
+    };
+    Ok(serde_json::from_str(&data).map_err(|error| format!("data is not JSON: {error}"))?)
+}
+
 impl Publish {
     fn message(self) -> Result<Message, Box<dyn std::error::Error>> {
-        let data = match self.data {
-            Some(data) => data,
-            None if std::io::stdin().is_terminal() => {
-                return Err("give the message's data with --data, or as JSON on stdin".into());
-            }
-            None => {
-                let mut data = String::new();
-                std::io::stdin().read_to_string(&mut data)?;
-                data
-            }
-        };
-        let data: Value =
-            serde_json::from_str(&data).map_err(|error| format!("data is not JSON: {error}"))?;
-        let mut message = Message::new(self.kind, data);
+        let mut message = Message::new(self.kind, read_data(self.data)?);
         if let Some(id) = self.id {
             message = message.id(id);
         }
@@ -392,7 +530,11 @@ fn parse_link(text: &str) -> Result<(String, String), String> {
 impl Report {
     fn new<T: Serialize + ?Sized>(value: &T, text: String) -> Self {
         let json = serde_json::to_string(value).expect("the bus's types serialize");
-        Self { json, text }
+        Self {
+            json,
+            text,
+            timed_out: false,
+        }
     }
 }
 

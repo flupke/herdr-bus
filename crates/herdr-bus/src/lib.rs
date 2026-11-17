@@ -34,6 +34,7 @@ mod delivery;
 mod error;
 mod messages;
 mod outputs;
+mod requests;
 mod schema;
 
 use std::fmt;
@@ -50,6 +51,7 @@ pub use error::{Error, Result};
 pub use jiff::Timestamp;
 pub use messages::{Link, Message, MessageQuery, Stored};
 pub use outputs::{Declared, Output};
+pub use requests::{Outcome, Reply, Request, RequestState, Take};
 /// The type of a message's `id`, so that an app need not take `uuid` itself.
 pub use uuid::Uuid;
 

@@ -60,6 +60,20 @@ const MIGRATIONS: &[&str] = &[
       UNIQUE (consumer, output)
     );
     ",
+    // 2: requests, each with its one reply, kept beside the log.
+    "
+    -- A request is a message of the log with a deadline, which takes one reply. Times are
+    -- RFC 3339, by the clock of this bus's machine.
+    CREATE TABLE requests (
+      seq      INTEGER PRIMARY KEY REFERENCES messages(seq),
+      deadline TEXT NOT NULL,
+      -- When a consumer took it, or NULL.
+      taken    TEXT,
+      -- The reply's data, JSON, and when it was given; both NULL until it is.
+      reply    TEXT,
+      replied  TEXT
+    );
+    ",
 ];
 
 /// How long a program waits for another's write lock.

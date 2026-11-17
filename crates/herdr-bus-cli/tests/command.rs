@@ -1,7 +1,7 @@
 //! The `herdr-bus` command's JSON, which herdr-bowtie and other programs read: each format is a
 //! hand-written literal, so a change breaks this test as it would break them.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -39,8 +39,17 @@ fn timeless(mut value: Value) -> Value {
     match &mut value {
         Value::Object(fields) => {
             for (key, field) in fields.iter_mut() {
-                if ["declared", "last_seen", "created", "published"].contains(&key.as_str()) {
-                    assert!(field.is_string(), "{key}: {field}");
+                let times = [
+                    "declared",
+                    "last_seen",
+                    "created",
+                    "published",
+                    "deadline",
+                    "taken",
+                    "replied",
+                ];
+                // A request's `taken` is a time, or null; a delivery's, a flag.
+                if times.contains(&key.as_str()) && field.is_string() {
                     *field = json!("<time>");
                 } else {
                     *field = timeless(field.take());
@@ -268,4 +277,133 @@ fn programs_opening_a_new_file_at_once_all_open_it() {
         }
         assert_eq!(json(&db, &["outputs"], None).as_array().unwrap().len(), 32);
     }
+}
+
+#[test]
+fn a_request_nobody_takes_exits_2_and_can_no_longer_be_taken() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = &dir.path().join("bus.db");
+    json(db, &["declare", "asks"], None);
+    let ask = [
+        "request",
+        "asks",
+        "--type",
+        "t",
+        "--data",
+        "{}",
+        "--timeout",
+        "0s",
+    ];
+    let id = "00000000-0000-0000-0000-00000000000a";
+    let output = herdr_bus(db, &[&ask[..], &["--id", id, "--json"]].concat(), None);
+    assert_eq!(output.status.code(), Some(2));
+    let printed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        printed,
+        json!({ "seq": 1, "id": id, "timeout": { "taken": false } })
+    );
+    // For people, on stderr: the request's fate.
+    let output = herdr_bus(db, &ask, None);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not taken"));
+
+    assert_eq!(
+        json(db, &["take", "1"], None),
+        json!({ "seq": 1, "state": "expired" })
+    );
+    assert_eq!(
+        herdr_bus(db, &["reply", "1", "--data", "1"], None)
+            .status
+            .code(),
+        Some(1)
+    );
+}
+
+#[test]
+fn a_request_prints_its_reply_and_its_consumer_reads_the_documented_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = &dir.path().join("bus.db");
+    json(db, &["declare", "asks"], None);
+    json(db, &["connect", "answerer", "asks"], None);
+    // A session of the answerer, to learn when the request is on the bus.
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_herdr-bus"))
+        .arg("--db")
+        .arg(db)
+        .args(["serve", "answerer"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(serve.stdout.take().unwrap()).lines();
+    assert_eq!(lines.next().unwrap().unwrap(), r#"{"ready":{}}"#);
+
+    let id = "00000000-0000-0000-0000-00000000000b";
+    let ask = [
+        "request",
+        "asks",
+        "--type",
+        "t",
+        "--id",
+        id,
+        "--data",
+        "{}",
+        "--timeout",
+        "1h",
+    ];
+    let asker = Command::new(env!("CARGO_BIN_EXE_herdr-bus"))
+        .arg("--db")
+        .arg(db)
+        .args(ask)
+        .arg("--json")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert_eq!(lines.next().unwrap().unwrap(), r#"{"notify":{}}"#);
+    drop(serve.stdin.take());
+    serve.wait().unwrap();
+
+    let request = json!({ "deadline": "<time>", "taken": false, "replied": false });
+    let pulled = timeless(json(db, &["pull", "answerer"], None));
+    assert_eq!(pulled[0]["request"], request);
+    assert_eq!(
+        json(db, &["take", "1"], None),
+        json!({ "seq": 1, "state": "taken" })
+    );
+    assert_eq!(
+        json(db, &["take", "1"], None),
+        json!({ "seq": 1, "state": "taken_before" })
+    );
+    assert_eq!(
+        timeless(json(db, &["reply", "1"], Some(r#"{"answer": 42}"#))),
+        json!({ "seq": 1, "replied": "<time>" })
+    );
+    let output = asker.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    // In its documented order, which a reader of the bytes may rely on.
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{{\"seq\":1,\"id\":\"{id}\",\"reply\":{{\"answer\":42}}}}\n")
+    );
+    let printed = json!({ "seq": 1, "id": id, "reply": { "answer": 42 } });
+
+    // A second reply leaves the first; asked again, the request prints it at once.
+    json(db, &["reply", "1", "--data", "0"], None);
+    assert_eq!(json(db, &ask, None), printed);
+    assert_eq!(
+        json(db, &["take", "1"], None),
+        json!({ "seq": 1, "state": "replied" })
+    );
+    assert_eq!(
+        timeless(json(db, &["message", "1"], None))["request"],
+        json!({
+            "deadline": "<time>",
+            "taken": "<time>",
+            "reply": { "data": { "answer": 42 }, "replied": "<time>" },
+        })
+    );
+    assert_eq!(
+        timeless(json(db, &["pull", "answerer"], None))[0]["request"],
+        json!({ "deadline": "<time>", "taken": true, "replied": true })
+    );
 }

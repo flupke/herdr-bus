@@ -1,6 +1,6 @@
 ---
 name: herdr-bus
-description: Pass messages between programs through herdr-bus, the message bus each machine keeps. Use to publish on an output, connect a consumer to an output, pull and acknowledge a consumer's messages, tap every output, read another machine's bus, or look at what a bus holds.
+description: Pass messages between programs through herdr-bus, the message bus each machine keeps. Use to publish on an output, connect a consumer to an output, pull and acknowledge a consumer's messages, ask a request and wait for its reply, answer requests, tap every output, read another machine's bus, or look at what a bus holds.
 ---
 
 # herdr-bus
@@ -18,11 +18,14 @@ you run a command for the first time.
   for good to one output, at a **seq**: its place in the log, which grows across every output.
   Its producer defines its `type` and `data`; the bus knows no type.
 - A **consumer** is a reader, named `<name>@<machine id>`: the machine id is the id of the bus
-  of the machine it runs on, which `herdr-bus id` prints. On its own machine, its bare `<name>`
+  of the machine it runs on, which `herdr-bus id` prints there, on the machine's own bus: with
+  `--db` or `HERDR_BUS_DB` naming another file, it prints that file's id. On its own machine, its bare `<name>`
   is enough: the bus completes it with its own id.
 - A **connection** is one consumer's cursor on one output: the last message it acknowledged
   there. Connecting is how a consumer subscribes. A **tap** is a connection to every output,
   present and future: its output is `*`.
+- A **request** is a message with a deadline, which takes one **reply**: free JSON, kept with
+  the request in the bus it was asked on. A consumer **takes** a request before it handles it.
 
 Producers don't know their consumers, and a consumer with no connection simply has no messages.
 
@@ -79,6 +82,49 @@ there and leave it for the next pull. A message whose type you don't handle, ack
 Never acknowledge a message before you handled it: the bus refuses a seq the connection does not
 read, but not a seq you skipped.
 
+## Asking and answering
+
+A program that needs an answer asks a request with `herdr-bus request <output>`: a message as
+`herdr-bus publish` takes it, and a timeout. It waits, then prints the reply's data and exits 0.
+When the deadline passes first, it exits 2, apart from errors (exit 1), and says whether a
+consumer took the request:
+
+- not taken: nobody will ever handle it. The bus judges the deadline by its own clock, and a
+  request past it that nobody took can no longer be taken. To try again, ask a new request,
+  under a new id: the same id gives the same timeout at once.
+- taken: a consumer took it, and may still be handling it. Check its effect before you ask
+  again.
+
+With `--json`, it prints `{"seq": 44, "id": "…", "reply": <the reply's data>}`, or, with exit
+2, `{"seq": 44, "id": "…", "timeout": {"taken": false}}`, on stdout either way.
+
+The request is matched to its reply by its seq; you never name an output for the reply. Give
+the request an id of your own, made before the first attempt, when you may ask again
+after a crash or an error: asking again under the same id is the same request, with its first
+deadline, its data and its reply, which comes at once when it has one. An id names one
+question: a different question gets a new id.
+
+A program that answers is a consumer connected to the output requests come on, and the only
+program that answers the requests of that output: the bus does not record who took a request,
+so a second answering consumer would see each request the first took as `taken_before`. A
+delivery of a request carries `"request": {"deadline", "taken", "replied"}`; a plain message's
+has no `request`. For each request, in this order:
+
+1. Take it with `herdr-bus take <seq>`, before any work. It prints one of (`--json`:
+   `{"seq": 44, "state": "taken"}`):
+   - `taken`: it is yours. Handle it.
+   - `taken_before`: you took it already, before a crash. Look up the message's id in your own
+     records: handle it only if you did not finish it.
+   - `replied`: it has its reply. Nothing to do.
+   - `expired`: its asker gave up, and nobody may handle it. Skip it.
+2. Reply with `herdr-bus reply <seq>`, the data as JSON (`--json`: `{"seq": 44, "replied":
+   "<time>"}`). The first reply stands: a second one changes nothing. A reply to a request you
+   took is kept past its deadline, so that its asker gets it when it asks again; a reply to an
+   expired request is refused.
+3. Acknowledge it, as any message: whatever `take` said.
+
+A reply is no message: no output carries it, and no tap sees it.
+
 ## Hooking into everyone's messages
 
 A tap reads every output, one declared after it included, with a cursor of its own: `herdr-bus
@@ -88,7 +134,7 @@ copy: what it acknowledges changes no other connection. Each delivery names its 
 ## Waiting for messages
 
 A program that waits for its messages holds a session: it runs `herdr-bus serve <consumer>`, and
-speaks to it in JSON lines, one request on its stdin, one line back on its stdout. A Rust program
+speaks to it in JSON lines, one line on its stdin, one line back on its stdout. A Rust program
 has a client for it in the `herdr-bus-client` crate.
 
 - `serve` first sends `{"ready": {}}`.
@@ -103,9 +149,28 @@ has a client for it in the `herdr-bus-client` crate.
 - Acknowledge each one you handled with `{"ack": {"connection": 1, "seq": 43}}`: the answer is
   `{"acked": {"connection": 1, "seq": 43}}`. An ack of a message the session has not delivered
   is refused.
-- Every request gets exactly one answer, in the order sent; notifies come in between. A request
-  `serve` cannot carry out gets `{"error": "…"}`, and the session goes on.
+- Every line you send gets exactly one answer, in the order sent; notifies, and the replies and
+  timeouts of your requests, come in between. A line `serve` cannot carry out gets
+  `{"error": "…"}`, and the session goes on.
 - Close its stdin to end the session. Messages you did not acknowledge come back in the next.
+
+A session also writes on its machine's bus, which is how a program on another machine asks
+there. A program that only publishes and asks holds it under a consumer name with no
+connection. `message` is an envelope, of which only `type` and `data` are required:
+
+- `{"publish": {"output": "events", "message": {"type": "…", "data": …}}}`: the answer is
+  `{"published": {"seq": 43, "id": "…"}}`.
+- `{"request": {"output": "asks", "message": {…}, "timeout_ms": 5000}}`: the answer,
+  `{"requested": {"seq": 44, "id": "…"}}`, comes at once. Later comes exactly one of
+  `{"reply": {"to": 44, "id": "…", "data": …}}` and `{"timeout": {"to": 44, "id": "…",
+  "taken": false}}`, its `taken` as `herdr-bus request` says it. Several requests wait at
+  once, and their replies come in any order: match each by `to`.
+- `{"take": {"seq": 44}}`: the answer is `{"taken": {"seq": 44, "state": "taken"}}`, the state
+  one of the four `herdr-bus take` prints.
+- `{"reply": {"to": 44, "data": …}}`: the answer is `{"replied": {"to": 44}}`.
+
+Keep the session open until each request has its reply or timeout: a session that ends sends
+no more of them. It loses no request, though: connect again, and ask again under the same id.
 
 ## Reading another machine's bus
 
@@ -114,6 +179,9 @@ consumer's full name there, `<name>@<your own machine id>`, the id `herdr-bus id
 your machine: a bare name would be completed with the other machine's id, and name another
 consumer. Connect that full name to the outputs you read there, with `herdr-bus connect` run on
 that machine. The Rust client completes a bare name with your machine's id itself.
+
+To ask a program on another machine, ask through a session there, with `request` lines: the
+request and its reply stay in that machine's bus, and the session brings the reply back.
 
 ## Looking at the bus
 
