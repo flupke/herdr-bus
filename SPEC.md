@@ -337,6 +337,17 @@ Rules:
   the command wrote on stderr, at each call from then on. Lines that are
   not the session's before `ready`, as a login shell's profile prints,
   are skipped.
+- `Client::connect` waits `CONNECT_TIMEOUT` (30 s, past ssh's own 15 s
+  and a slow login) for `ready`, with every location;
+  `Client::connect_within` takes another wait. The command runs in a
+  process group of its own: past the wait, the group is killed, the
+  command reaped, and `connect` fails with where `serve` ran, that it did
+  not answer in time, and what the command wrote on stderr. A session that
+  stops, by `close` or drop, kills the group too. Outside the app's group,
+  the command misses a signal sent to it, such as Ctrl-C: once the app is
+  gone, `serve` ends when its stdin closes, and a silent link lasts until
+  it times out. It cannot read the terminal either: a `Command` must not
+  prompt.
 
 ## CLI
 

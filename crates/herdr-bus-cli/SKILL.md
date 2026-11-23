@@ -178,7 +178,9 @@ Run the session on that machine, through anything that gives a pipe, such as `ss
 consumer's full name there, `<name>@<your own machine id>`, the id `herdr-bus id` prints on
 your machine: a bare name would be completed with the other machine's id, and name another
 consumer. Connect that full name to the outputs you read there, with `herdr-bus connect` run on
-that machine. The Rust client completes a bare name with your machine's id itself.
+that machine. The Rust client completes a bare name with your machine's id itself, and gives up
+on a session that sends no `ready` within 30 s, killing the command it ran: a link that stays
+silent fails instead of hanging. Give your own session a deadline of the same kind.
 
 To ask a program on another machine, ask through a session there, with `request` lines: the
 request and its reply stay in that machine's bus, and the session brings the reply back.

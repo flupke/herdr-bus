@@ -257,8 +257,10 @@ name = "herdr-bus-client"
 version = "0.1.0"
 dependencies = [
  "herdr-bus",
+ "rustix",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 

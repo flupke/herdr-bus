@@ -33,12 +33,14 @@ pub mod protocol;
 mod reader;
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
+use std::os::unix::process::CommandExt as _;
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use herdr_bus::{Bus, ConnectionId, Delivery, Message, Seq, Take};
+use rustix::process::{Pid, Signal, kill_process_group};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -98,7 +100,8 @@ pub struct Client {
     /// The callers waiting for what `serve` sends, to whom the thread that reads it hands each
     /// line.
     waiters: Arc<Waiters>,
-    child: Mutex<Child>,
+    /// The command, until the session is stopped.
+    child: Mutex<Option<Child>>,
     /// Where `serve` runs, for errors: `here`, `on <machine>`, or `through <program>`.
     place: String,
     /// [`GRACE`], which a test shortens.
@@ -109,6 +112,10 @@ pub struct Client {
 /// of it, before it says the link went silent.
 pub const GRACE: Duration = Duration::from_secs(2);
 
+/// How long [`Client::connect`] waits for `serve`'s `ready`: longer than ssh's own 15 s to reach
+/// a machine, plus a slow login shell there.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How much of what the command writes on stderr the client keeps, the end of it, to explain a
 /// session that did not start, or ended.
 const STDERR_TAIL: usize = 4096;
@@ -118,7 +125,21 @@ const STDERR_TAIL: usize = 4096;
 const STDERR_GRACE: Duration = Duration::from_secs(1);
 
 impl Client {
-    /// Starts `herdr-bus serve <consumer>` at `location`; fails unless it answers `ready`.
+    /// Starts `herdr-bus serve <consumer>` at `location`; fails unless it answers `ready` within
+    /// [`CONNECT_TIMEOUT`], as [`Client::connect_within`] does.
+    pub fn connect(location: BusLocation, consumer: &str) -> Result<Client> {
+        Self::connect_within(location, consumer, CONNECT_TIMEOUT)
+    }
+
+    /// Starts `herdr-bus serve <consumer>` at `location`; fails unless it answers `ready` within
+    /// `timeout` of the command's start. Past it, the command is killed with its process group,
+    /// which holds every process it started that did not leave it, and the error says what it
+    /// wrote on stderr; a process that left the group and holds stderr delays it by up to 1 s.
+    ///
+    /// The command runs in a process group of its own, so a signal to the app's group, such as
+    /// Ctrl-C in a terminal, does not reach it: once the app is gone, `serve` ends when its stdin
+    /// closes, and a link that went silent lasts until it times out. Nor can the command read
+    /// the terminal, which would stop it: a `Command` must not prompt there.
     ///
     /// `Local` runs `herdr-bus` from `PATH`. `Machine` finds the machine's `target` in `hc
     /// machine ls --json`, and runs `herdr-bus` there through `ssh`, from a login shell's
@@ -129,7 +150,11 @@ impl Client {
     /// `Machine`. A command with no program is refused.
     ///
     /// A program that only publishes and asks gives a consumer name with no connection.
-    pub fn connect(location: BusLocation, consumer: &str) -> Result<Client> {
+    pub fn connect_within(
+        location: BusLocation,
+        consumer: &str,
+        timeout: Duration,
+    ) -> Result<Client> {
         let (command, place) = match location {
             BusLocation::Local => {
                 let mut command = Command::new("herdr-bus");
@@ -143,7 +168,7 @@ impl Client {
             }
             BusLocation::Command(argv) => through(&argv, consumer)?,
         };
-        Self::start(command, &place)
+        Self::start(command, &place, timeout)
     }
 
     /// The consumer's next messages, at most `limit`, as `Bus::pull` returns them; where
@@ -238,12 +263,15 @@ impl Client {
         self.stop();
     }
 
-    /// Runs `command`, which runs `herdr-bus serve`, and waits for its `ready`.
-    fn start(mut command: Command, place: &str) -> Result<Client> {
+    /// Runs `command`, which runs `herdr-bus serve`, and waits for its `ready` until `timeout`.
+    fn start(mut command: Command, place: &str, timeout: Duration) -> Result<Client> {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // A group of its own, which `kill` ends whole: a process the command started, such
+            // as the child of `sh -c` or ssh's proxy, holds the pipes too.
+            .process_group(0)
             .spawn()
             .map_err(|source| Error::Spawn {
                 program: command.get_program().to_string_lossy().into_owned(),
@@ -255,28 +283,29 @@ impl Client {
             unreachable!("the three are piped");
         };
         let stderr = Stderr::read(stderr);
-        let mut from_serve = BufReader::new(from_serve);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            if !matches!(from_serve.read_line(&mut line), Ok(read) if read > 0) {
+        // Read on a thread, so that a link silent from the start never holds the caller past
+        // `timeout`; the thread ends once `kill` closed the pipe.
+        let (started, start) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = started.send(ready(BufReader::new(from_serve)));
+        });
+        let from_serve = match start.recv_timeout(timeout) {
+            Ok(Start::Ready(from_serve)) => from_serve,
+            got => {
                 drop(to_serve);
-                let _ = child.wait();
-                return Err(Error::Session(
-                    stderr.why(format!("herdr-bus serve did not start {place}")),
-                ));
+                kill(child);
+                // Once the command is killed, its stderr ends: `why` reads all of it.
+                return Err(Error::Session(match got {
+                    Ok(Start::First(line)) => {
+                        format!("herdr-bus serve {place} sent {line:?} first")
+                    }
+                    Err(RecvTimeoutError::Timeout) => stderr.why(format!(
+                        "herdr-bus serve {place} did not answer within {timeout:?}"
+                    )),
+                    _ => stderr.why(format!("herdr-bus serve did not start {place}")),
+                }));
             }
-            match serde_json::from_str(&line) {
-                Ok(Line::Ready {}) => break,
-                Ok(line) => {
-                    return Err(Error::Session(format!(
-                        "herdr-bus serve {place} sent {line:?} first"
-                    )));
-                }
-                // What a login shell's profile prints there comes before `serve` runs.
-                Err(_) => {}
-            }
-        }
+        };
         let waiters = Arc::new(Waiters::default());
         std::thread::spawn({
             let waiters = Arc::clone(&waiters);
@@ -288,7 +317,7 @@ impl Client {
         Ok(Client {
             to_serve: Mutex::new(Some(lines)),
             waiters,
-            child: Mutex::new(child),
+            child: Mutex::new(Some(child)),
             place: place.to_owned(),
             grace: GRACE,
         })
@@ -341,10 +370,46 @@ impl Client {
     /// and it stops.
     fn stop(&self) {
         drop(lock(&self.to_serve).take());
-        let mut child = lock(&self.child);
-        let _ = child.kill();
-        let _ = child.wait();
+        if let Some(child) = lock(&self.child).take() {
+            kill(child);
+        }
     }
+}
+
+/// What came first from `serve`.
+enum Start {
+    /// `ready`, and the rest of the session to read.
+    Ready(BufReader<ChildStdout>),
+    /// Another line of the session.
+    First(Line),
+    /// The end of its stdout.
+    Ended,
+}
+
+/// Reads `from_serve` until `ready`, skipping the lines that are not the session's.
+fn ready(mut from_serve: BufReader<ChildStdout>) -> Start {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if !matches!(from_serve.read_line(&mut line), Ok(read) if read > 0) {
+            return Start::Ended;
+        }
+        match serde_json::from_str(&line) {
+            Ok(Line::Ready {}) => return Start::Ready(from_serve),
+            Ok(line) => return Start::First(line),
+            // What a login shell's profile prints there comes before `serve` runs.
+            Err(_) => {}
+        }
+    }
+}
+
+/// Kills the process group `child` leads, which holds every process the command started that
+/// did not leave it, and reaps `child`. `child` is not reaped before, so its pid still names the
+/// group.
+fn kill(mut child: Child) {
+    // Fails when the group ended already.
+    let _ = kill_process_group(Pid::from_child(&child), Signal::KILL);
+    let _ = child.wait();
 }
 
 /// Writes each line of `lines` on `serve`'s stdin, until the client stops or the pipe breaks.

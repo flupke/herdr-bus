@@ -19,6 +19,8 @@ notify = "8.2"
 # herdr-bowtie and herdr-ruminate link SQLite through rusqlite too: two versions of it in one
 # build fail to link, so keep this one theirs (README.md, Using it from an app).
 rusqlite = { version = "0.38", features = ["bundled"] }
+# What the client kills the process group of the command it ran with; herdr-bowtie takes the same.
+rustix = { version = "1.1", features = ["process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3.20"
