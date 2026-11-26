@@ -1,6 +1,6 @@
 //! Learning of the bus's writes: every write modifies the bus file's `-wal` file, and no read
 //! does. The event comes before the write can be read, so a watcher looks a moment later, and
-//! now and then without an event too (`.agents/wiki/shell-checks.md`, Watching the file).
+//! now and then without an event too (`.agents/research/watching-the-bus-file.md`).
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -11,7 +11,7 @@ use notify::event::ModifyKind;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 /// How long after a write's event a watcher looks at the bus: 30 ms after it, a read saw every
-/// write in the runs the wiki records.
+/// write in the runs `.agents/research/watching-the-bus-file.md` records.
 pub(crate) const SETTLE: Duration = Duration::from_millis(30);
 
 /// How long a watcher waits without an event before it looks anyway.

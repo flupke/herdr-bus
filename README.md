@@ -77,8 +77,9 @@ declaring it again brings it back.
 
 ## Using it from an app
 
-No crate is published. An app takes them as `git` dependencies, its `Cargo.lock` pinning the
-revision (`cargo update -p herdr-bus` moves it), so that a clone of the app alone builds:
+No crate is published. An app, such as herdr-bowtie or herdr-ruminate, takes them as `git`
+dependencies, its `Cargo.lock` pinning the revision (`cargo update -p herdr-bus` moves it), so
+that a clone of the app alone builds:
 
 ```toml
 [dependencies]
@@ -109,6 +110,9 @@ that command: the client appends the line to run there as its last argument. Eve
 `take` and `reply`, and several wait in `request` at once. Once the session ends, or `close()`
 ends it from any thread, every call returns an error, and the app connects again: nothing is
 lost.
+
+The bus does no cross-machine work: a program reaches another machine's bus through a session
+there, or by running the command there, such as through `hc exec --on <machine> herdr-bus …`.
 
 `herdr_bus::Timestamp`, a message's `time`, is `jiff`'s, re-exported. The bus links SQLite
 through `rusqlite` 0.38 with its `bundled` feature. An app that links SQLite through `rusqlite`

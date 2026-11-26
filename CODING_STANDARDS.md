@@ -5,8 +5,7 @@ read. Code review checks the change against each rule, and a finding names the r
 Leave out what the checks already enforce: clippy with `-Dwarnings`, and the complexity gate of
 `make lint`.
 
-Keep this file under 100 lines. When a topic outgrows it, move the topic to a page of
-`.agents/wiki/` and leave a line here that says when to read the page.
+Keep this file under 100 lines.
 
 ## Names
 
@@ -47,16 +46,35 @@ Keep this file under 100 lines. When a topic outgrows it, move the topic to a pa
 
 ## Tests
 
-- `.agents/wiki/unit-tests.md` holds the testing policy and the kinds of tautological test:
-  read it before you review a test, and hold each test the change adds or keeps to it.
+Hold each test the change adds or keeps to these rules.
+
+- Test the behaviour callers rely on once, at the lowest level that sees it: the delivery
+  guarantees (a message comes back until acknowledged, a tap reads every output, two programs at
+  once lose nothing and get nothing twice) and the formats other programs read (the command's
+  `--json`, the shared types). A smaller suite counts as progress.
+- Judge a test by two edits: break the behaviour (a wrong value, an effect skipped or done twice)
+  and it fails; change only the internals, every observable result the same, and it still passes.
+  Rewrite or delete a test that fails either.
+- The expected value is written by hand from the behaviour the code owes, or comes from an
+  independent source, and a format this repository owns is compared with a hand-written literal.
+- Delete a tautological test, or rewrite it to assert what the code computes:
+  - **Mirror**: the expected value is computed by the code under test or a copy of its logic.
+  - **Echo**: the test reads back a field it set, a getter of a constructor argument, or a clone.
+  - **Constant pin**: `assert_eq!(LIMIT, 50)`; build the boundary input from the constant instead.
+  - **Library behaviour**: std, plain serde derives, SQLite's own behaviour.
+  - **Vacuous assertion**: true for every value, or met by an error as well as a success.
+- A test waits on an event, never on the clock: a thread's end, a flag the other side sets, and
+  ordering to prove that nothing happened. nextest ends a test still running after two minutes.
 
 ## Docs
 
 - `README.md` is for people deciding whether to use herdr-bus: what it is, how to install the
-  command, how an app takes the crates. History goes in change descriptions, decisions in
-  `.agents/adr/`, knowledge for agents in the wiki, and how to develop here in `AGENTS.md`.
+  command, how an app takes the crates. History goes in change descriptions, the reason for a
+  choice in `SPEC.md` or the change description, a tool procedure in a skill of
+  `.agents/skills/`, and how to develop here in `AGENTS.md`.
 
 ## Text for agents
 
 - Text that agents read follows the `writing-for-agents` skill when it is installed:
-  `AGENTS.md`, this file and the wiki. Load the skill before you write or review such text.
+  `AGENTS.md`, this file and the skills of `.agents/skills/`. Load the skill before you write or
+  review such text.
