@@ -1,5 +1,3 @@
-//! The outputs programs declare and publish on.
-
 use jiff::Timestamp;
 use rusqlite::{OptionalExtension, Row, Transaction, params};
 use serde::Serialize;
@@ -7,7 +5,6 @@ use serde::Serialize;
 use crate::codec::{json, parsed, to_json};
 use crate::{Bus, Connection, ConnectionId, Error, Result, TAP};
 
-/// An output as its program declares it.
 #[derive(Clone, Debug)]
 pub struct Output {
     name: String,
@@ -15,7 +12,6 @@ pub struct Output {
     types: Vec<String>,
 }
 
-/// An output as the bus holds it.
 #[derive(Clone, Debug, Serialize)]
 pub struct Declared {
     pub name: String,
@@ -38,14 +34,12 @@ impl Output {
         }
     }
 
-    /// What it carries, in a line for people.
     #[must_use]
     pub fn describe(mut self, description: impl Into<String>) -> Self {
         self.description = description.into();
         self
     }
 
-    /// The message types it carries.
     #[must_use]
     pub fn types<T: Into<String>>(mut self, types: impl IntoIterator<Item = T>) -> Self {
         self.types = types.into_iter().map(Into::into).collect();
@@ -77,7 +71,6 @@ impl Bus {
                     Timestamp::now().to_string(),
                 ],
             )?;
-            // In the same transaction: a delete since would refuse an output just declared.
             declared_output(tx, &output.name)
         })
     }
@@ -134,7 +127,6 @@ fn declared(row: &Row<'_>) -> rusqlite::Result<Declared> {
     })
 }
 
-/// The output `name`, with its connections, unless it is deleted.
 fn declared_output(tx: &Transaction, name: &str) -> Result<Declared> {
     require(tx, name)?;
     let mut output = tx.query_row(&format!("{SELECT} WHERE name = ?1"), [name], declared)?;
@@ -151,7 +143,6 @@ fn with_connections(mut output: Declared, connections: &[Connection]) -> Declare
     output
 }
 
-/// Fails unless the output `name` is declared and not deleted.
 pub(crate) fn require(tx: &Transaction, name: &str) -> Result<()> {
     let deleted: Option<bool> = tx
         .query_row(

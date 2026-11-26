@@ -7,7 +7,6 @@ use tempfile::TempDir;
 
 use super::*;
 
-/// A private bus file, with an output `events` the consumer `inbox` of this machine reads.
 struct Fixture {
     _dir: TempDir,
     path: PathBuf,
@@ -29,7 +28,6 @@ fn fixture() -> Fixture {
     }
 }
 
-/// A message named `name` in its data, with an id the producer derives from the name.
 fn message(name: &str) -> Message {
     Message::new("producer.thing.happened", json!({ "n": name }))
         .id(Uuid::new_v5(&Uuid::NAMESPACE_OID, name.as_bytes()))
@@ -54,13 +52,11 @@ fn a_pulled_message_comes_back_until_acknowledged() {
     assert_eq!(first[0].message.data, json!({ "n": "a" }));
     assert_eq!(names(&bus.pull("inbox", 50).unwrap()), ["a", "b"]);
 
-    // The consumer acknowledges the first, then crashes: another opens the file.
     bus.ack(first[0].connection, first[0].seq).unwrap();
     let reopened = Bus::open(path).unwrap();
     assert_eq!(names(&reopened.pull("inbox", 50).unwrap()), ["b"]);
 
     reopened.ack(first[1].connection, first[1].seq).unwrap();
-    // Acknowledging an earlier one again moves nothing back.
     reopened.ack(first[0].connection, first[0].seq).unwrap();
     assert!(reopened.pull("inbox", 50).unwrap().is_empty());
 }
@@ -75,7 +71,6 @@ fn a_tap_reads_every_output_at_its_own_pace() {
     bus.publish("events", &message("a")).unwrap();
     bus.publish("news", &message("b")).unwrap();
 
-    // The inbox's connection reads its own output alone.
     let inbox = bus.pull("inbox", 50).unwrap();
     assert_eq!(names(&inbox), ["a"]);
     bus.ack(*connection, inbox[0].seq).unwrap();
@@ -102,8 +97,6 @@ fn a_connection_from_now_skips_what_its_output_already_holds() {
     assert_eq!(names(&bus.pull("all", 50).unwrap()), ["old", "new"]);
 }
 
-/// `serve` notifies a consumer from its positions: they must show a message to pull exactly
-/// where a pull returns one, or a session never wakes, or wakes for nothing again and again.
 #[test]
 fn positions_show_a_message_to_pull_exactly_where_a_pull_returns_one() {
     let Fixture {
@@ -121,13 +114,11 @@ fn positions_show_a_message_to_pull_exactly_where_a_pull_returns_one() {
     bus.declare(&Output::new("news")).unwrap();
     assert_eq!((waiting("inbox"), waiting("hook")), (false, false));
 
-    // On another output: the tap has it to pull, the inbox does not.
     bus.publish("news", &message("a")).unwrap();
     assert_eq!((waiting("inbox"), waiting("hook")), (false, true));
 
     bus.publish("events", &message("b")).unwrap();
     assert!(waiting("inbox"));
-    // A disabled connection delivers nothing, and shows nothing to pull.
     bus.set_enabled(*connection, false).unwrap();
     assert!(!waiting("inbox"));
 }
@@ -173,7 +164,6 @@ fn publishing_an_id_again_returns_its_seq_and_adds_nothing() {
     let seq = bus.publish("events", &message("a")).unwrap();
     let other = Message::new("producer.other", json!(2)).id(message("a").id);
     assert_eq!(bus.publish("events", &other).unwrap(), seq);
-    // A duplicate uses up no seq.
     let next = bus.publish("events", &message("b")).unwrap();
     assert_eq!(next, Seq(seq.0 + 1));
     let pulled = bus.pull("inbox", 50).unwrap();
@@ -207,7 +197,6 @@ fn a_bare_name_is_the_consumer_of_this_machine() {
         bus, connection, ..
     } = &fixture();
     let full = format!("inbox@{}", bus.id());
-    // Another way to write the same machine id is the same consumer too.
     let other_form = format!("inbox@{}", bus.id().simple().to_string().to_uppercase());
     assert_eq!(
         bus.connect(&full, "events", Start::Now).unwrap(),
@@ -219,7 +208,6 @@ fn a_bare_name_is_the_consumer_of_this_machine() {
     );
     assert_eq!(bus.connection(*connection).unwrap().consumer, full);
 
-    // The same name on another machine reads the output with a cursor of its own.
     let far = format!("inbox@{}", Uuid::from_u128(7));
     let other = bus.connect(&far, "events", Start::Now).unwrap();
     assert_ne!(other, *connection);
@@ -280,14 +268,12 @@ fn a_deleted_output_keeps_its_messages_and_comes_back_as_it_was() {
     ));
     assert!(matches!(bus.delete("events"), Err(Error::DeletedOutput(_))));
     assert!(bus.pull("inbox", 50).unwrap().is_empty());
-    // The tap stays, and still gets what the output published before it went.
     let tapped = bus.pull("hook", 50).unwrap();
     assert_eq!(names(&tapped), ["a"]);
     assert_eq!(tapped[0].connection, tap);
 
     let back = bus.declare(&Output::new("events")).unwrap();
     assert!(back.connections.is_empty());
-    // It is the same output: its history, and its ids, which a retried publish finds.
     assert_eq!(bus.publish("events", &message("a")).unwrap(), seq);
     let history = MessageQuery {
         output: Some("events".to_owned()),
@@ -313,9 +299,6 @@ fn a_file_of_a_newer_schema_is_refused_unchanged() {
     assert!(!dir.path().join("bus.db-wal").exists());
 }
 
-/// Programs at once, each with its own handle on the file: two publish while two consumers,
-/// one through a connection and one through a tap, pull and acknowledge. Each gets every
-/// message, and none twice.
 #[test]
 fn concurrent_publishers_and_consumers_lose_nothing() {
     const PER_PRODUCER: usize = 200;
@@ -326,7 +309,6 @@ fn concurrent_publishers_and_consumers_lose_nothing() {
         let reader = Bus::open(path).unwrap();
         let mut pulled = Vec::new();
         loop {
-            // Read the count first: a pull after the producers are done sees all they published.
             let done = producing.load(Ordering::SeqCst) == 0;
             let batch = reader.pull(consumer, 7).unwrap();
             for delivery in &batch {
@@ -372,7 +354,6 @@ fn a_request_is_taken_once_and_keeps_its_first_reply() {
     let Outcome::Pending { deadline } = bus.outcome(seq).unwrap() else {
         panic!("a request just asked is pending");
     };
-    // Asked again, after a crash of its asker: the same request, deadline included.
     assert_eq!(
         bus.request("events", &message("ask"), HOUR * 2).unwrap(),
         seq
@@ -389,7 +370,6 @@ fn a_request_is_taken_once_and_keeps_its_first_reply() {
     );
 
     assert_eq!(bus.take(seq).unwrap(), Take::Taken);
-    // The consumer crashed after its take: the request comes back, marked taken.
     assert!(request(bus).taken);
     assert_eq!(bus.take(seq).unwrap(), Take::TakenBefore);
 
@@ -416,7 +396,6 @@ fn a_request_is_taken_once_and_keeps_its_first_reply() {
 #[test]
 fn a_request_past_its_deadline_that_nobody_took_is_never_handled() {
     let Fixture { bus, .. } = &fixture();
-    // A timeout of nothing: the deadline is now.
     let seq = bus
         .request("events", &message("late"), std::time::Duration::ZERO)
         .unwrap();
@@ -434,7 +413,6 @@ fn a_request_taken_before_its_deadline_still_takes_its_reply_after_it() {
     let Fixture { bus, .. } = &fixture();
     let seq = bus.request("events", &message("slow"), HOUR).unwrap();
     assert_eq!(bus.take(seq).unwrap(), Take::Taken);
-    // The hour goes by while the consumer works.
     bus.sql
         .execute(
             "UPDATE requests SET deadline = ?1",
@@ -445,7 +423,6 @@ fn a_request_taken_before_its_deadline_still_takes_its_reply_after_it() {
     assert_eq!(bus.take(seq).unwrap(), Take::TakenBefore);
 
     bus.reply(seq, json!("done")).unwrap();
-    // Asked again, it returns the reply.
     assert_eq!(bus.request("events", &message("slow"), HOUR).unwrap(), seq);
     let Outcome::Replied(reply) = bus.outcome(seq).unwrap() else {
         panic!("the reply stands");
@@ -469,7 +446,6 @@ fn only_a_request_is_taken_or_replied_to() {
         ));
         assert!(matches!(bus.outcome(seq), Err(Error::NotARequest(_))));
     }
-    // A plain message's delivery carries no request.
     assert_eq!(bus.pull("inbox", 50).unwrap()[0].request, None);
     assert!(matches!(
         bus.request("nowhere", &message("a"), HOUR),

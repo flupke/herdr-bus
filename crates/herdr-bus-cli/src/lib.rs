@@ -27,8 +27,6 @@ use jiff::{SignedDuration, Timestamp};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-/// The skill `herdr-bus skill` prints. It names each command and leaves their options to their
-/// `--help`, so that it cannot drift from them; a test checks the commands it names.
 const SKILL: &str = include_str!("../SKILL.md");
 
 #[derive(Parser)]
@@ -183,14 +181,12 @@ enum From {
     Beginning,
 }
 
-/// What `publish` prints.
 #[derive(Serialize)]
 struct Published {
     seq: Seq,
     id: Uuid,
 }
 
-/// What `request` prints: its seq and id, then the reply's data or the timeout.
 #[derive(Serialize)]
 struct Asked {
     seq: Seq,
@@ -206,30 +202,24 @@ enum Fate {
     Timeout { taken: bool },
 }
 
-/// What `take` prints.
 #[derive(Serialize)]
 struct Took {
     seq: Seq,
     state: herdr_bus::Take,
 }
 
-/// What `reply` prints: the time of the reply that stands.
 #[derive(Serialize)]
 struct Replied {
     seq: Seq,
     replied: Timestamp,
 }
 
-/// What a command prints: its JSON document, its fields in their documented order, or lines
-/// for people.
 struct Report {
     json: String,
     text: String,
-    /// A request's deadline passed with no reply: exit 2, the lines for people on stderr.
     timed_out: bool,
 }
 
-/// What a command did: its report, or nothing for `serve`, which wrote its session already.
 type Done = Result<Option<Report>, String>;
 
 /// Runs the `herdr-bus` command with `args`, as `herdr-bus` with these arguments would: it reads
@@ -263,8 +253,6 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString>>) -> ExitCode {
     }
 }
 
-/// Prints what the command did: its JSON, or lines for people, on stdout, or on stderr for an
-/// error or a timeout.
 fn print(outcome: &Done, json: bool) -> std::io::Result<()> {
     match outcome {
         Ok(None) => Ok(()),
@@ -282,7 +270,6 @@ fn print(outcome: &Done, json: bool) -> std::io::Result<()> {
     }
 }
 
-/// 1 on an error, 2 when a request's deadline passed with no reply.
 fn exit_code(outcome: &Done) -> ExitCode {
     match outcome {
         Err(_) => ExitCode::FAILURE,
@@ -294,7 +281,6 @@ fn exit_code(outcome: &Done) -> ExitCode {
 }
 
 fn execute(cli: Cli) -> Done {
-    // It needs no bus file, and creates none.
     if let Command::Skill = cli.command {
         return Ok(Some(Report::new(
             &json!({ "skill": SKILL }),
@@ -333,7 +319,6 @@ fn execute(cli: Cli) -> Done {
     .map_err(|error| error.to_string())
 }
 
-/// The commands of producers and consumers, and reading the log.
 fn run_log(bus: &Bus, command: Command) -> Result<Report, Box<dyn std::error::Error>> {
     Ok(match command {
         Command::Declare {
@@ -415,7 +400,6 @@ fn delete_report(bus: &Bus, output: &str) -> Result<Report, Box<dyn std::error::
     ))
 }
 
-/// The commands that make, change and list connections.
 fn run_connections(bus: &Bus, command: Command) -> Result<Report, Box<dyn std::error::Error>> {
     Ok(match command {
         Command::Connections => {
@@ -446,7 +430,6 @@ fn run_connections(bus: &Bus, command: Command) -> Result<Report, Box<dyn std::e
     })
 }
 
-/// Asks a request and waits for its outcome, in this process: exit 2 on a timeout.
 fn ask_report(
     bus: &Bus,
     path: &std::path::Path,
@@ -486,7 +469,6 @@ fn ask_report(
     })
 }
 
-/// The data `--data` gives, or else stdin, as JSON.
 fn read_data(data: Option<String>) -> Result<Value, Box<dyn std::error::Error>> {
     let data = match data {
         Some(data) => data,

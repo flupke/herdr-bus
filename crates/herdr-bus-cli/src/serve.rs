@@ -1,12 +1,3 @@
-//! `herdr-bus serve`: a session with one consumer, in JSON lines over stdin and stdout, as
-//! `herdr_bus_client::protocol` describes them. It tells the consumer when it has messages
-//! past those the session delivered, and sends messages only when asked. It publishes, asks,
-//! takes and replies to requests for the consumer, and sends the reply or timeout of each
-//! request it asked once there is one.
-//!
-//! It learns of writes by watching the bus file's folder ([`crate::watch`]), and wakes at the
-//! nearest deadline of the requests it asked.
-
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::{self, BufRead, Write};
@@ -19,21 +10,14 @@ use herdr_bus_client::protocol::{Call, Line};
 
 use crate::watch::{BACKSTOP, SETTLE, instant_of, watch};
 
-/// What wakes the session.
 enum Event {
-    /// A line from the consumer.
     Line(String),
-    /// A line from the consumer that is not UTF-8.
     Unreadable,
-    /// The `-wal` file was modified: something was written.
     Written,
-    /// The consumer closed stdin: the session is over.
     Closed,
 }
 
-/// Holds the session until the consumer closes stdin, or stops reading stdout.
 pub(crate) fn serve(bus: Bus, path: &Path, consumer: &str) -> Result<(), Box<dyn Error>> {
-    // Refuses a name that is no consumer's before the session starts.
     bus.positions(consumer)?;
     let (events, received) = mpsc::channel();
     // Without a watcher, as where the system has none left to give, the session looks once a
@@ -56,7 +40,6 @@ pub(crate) fn serve(bus: Bus, path: &Path, consumer: &str) -> Result<(), Box<dyn
         nearest: None,
     };
     match session.run(&received, &mut io::stdout().lock()) {
-        // The consumer stopped reading: it has ended the session.
         Err(error) if is_broken_pipe(&*error) => Ok(()),
         outcome => outcome,
     }
@@ -65,14 +48,9 @@ pub(crate) fn serve(bus: Bus, path: &Path, consumer: &str) -> Result<(), Box<dyn
 struct Session {
     bus: Bus,
     consumer: String,
-    /// The highest seq the session delivered on each connection: an ack past it is refused.
     delivered: HashMap<ConnectionId, Seq>,
-    /// Whether the consumer was notified since it last asked for its messages.
     notified: bool,
-    /// Each request the session asked that has no outcome yet, its seq and id: one entry for
-    /// each ask, which gets one reply or timeout.
     asked: Vec<(Seq, Uuid)>,
-    /// The nearest deadline of the requests in `asked`.
     nearest: Option<Timestamp>,
 }
 
@@ -103,7 +81,6 @@ impl Session {
                 Ok(Event::Closed) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
                 Err(RecvTimeoutError::Timeout) => {
                     self.look(out)?;
-                    // A deadline may have woken it before a write had settled.
                     if Instant::now() >= due {
                         due = Instant::now() + BACKSTOP;
                     }
@@ -112,8 +89,6 @@ impl Session {
         }
     }
 
-    /// Notifies the consumer, once, when it has messages past those the session delivered,
-    /// and sends the outcome of each request it asked that has one.
     fn look(&mut self, out: &mut impl Write) -> Result<(), Box<dyn Error>> {
         if !self.notified && self.has_new()? {
             send(out, &Line::Notify {})?;
@@ -134,8 +109,6 @@ impl Session {
         }))
     }
 
-    /// Sends the reply or timeout of each request the session asked that has one, and keeps
-    /// the nearest deadline of the others.
     fn settle(&mut self, out: &mut impl Write) -> Result<(), Box<dyn Error>> {
         self.nearest = None;
         for (seq, id) in std::mem::take(&mut self.asked) {
@@ -209,11 +182,9 @@ impl Session {
     }
 
     fn get_messages(&mut self, limit: usize) -> Result<Line, String> {
-        // An empty answer would read as "nothing left", and bring the next notify at once.
         if limit == 0 {
             return Err("limit must be at least 1".to_owned());
         }
-        // Asked for, whatever comes of it: the consumer may be notified again.
         self.notified = false;
         let deliveries = self
             .bus
@@ -240,7 +211,6 @@ impl Session {
             ));
         }
         match self.bus.ack(connection, seq) {
-            // A connection removed since has nothing left to acknowledge.
             Ok(()) | Err(BusError::UnknownConnection(_)) => Ok(Line::Acked { connection, seq }),
             Err(error) => Err(error.to_string()),
         }

@@ -1,6 +1,3 @@
-//! `herdr-bus request`: asks a request and waits, in this process on the bus's machine, for
-//! its reply or its deadline.
-
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -9,8 +6,6 @@ use herdr_bus::{Bus, Message, Outcome, Seq};
 
 use crate::watch::{BACKSTOP, SETTLE, instant_of, watch};
 
-/// Asks `message` on `output` as a request with `timeout`, and returns its seq and outcome:
-/// its reply, or its timeout. Never [`Outcome::Pending`].
 pub(crate) fn ask(
     bus: &Bus,
     path: &Path,
@@ -19,8 +14,6 @@ pub(crate) fn ask(
     timeout: Duration,
 ) -> Result<(Seq, Outcome), Box<dyn std::error::Error>> {
     let (written, wakes) = mpsc::channel();
-    // Watching before the request goes, so that a reply written at once is not missed.
-    // Without a watcher, it looks once a second all the same.
     let to_watcher = written.clone();
     let _watcher = watch(path, move || {
         let _ = to_watcher.send(());

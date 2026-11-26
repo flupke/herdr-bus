@@ -1,6 +1,3 @@
-//! `herdr-bus serve` and the client crate's `Client`, through the built binary. The session's lines
-//! are compared with hand-written literals: consumers in other languages read them.
-
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -10,7 +7,6 @@ use herdr_bus::{Bus, Message, Output, Start, Timestamp, Uuid};
 use herdr_bus_client::{BusLocation, Client, Error, Outcome};
 use serde_json::{Value, json};
 
-/// A `herdr-bus serve` the test speaks to line by line.
 struct Serve {
     child: Child,
     input: Option<ChildStdin>,
@@ -38,7 +34,6 @@ impl Serve {
         writeln!(self.input.as_mut().unwrap(), "{line}").unwrap();
     }
 
-    /// The next line `serve` sends: the test waits for it.
     fn receive(&mut self) -> Value {
         let mut line = String::new();
         assert_ne!(self.output.read_line(&mut line).unwrap(), 0, "serve ended");
@@ -53,7 +48,6 @@ impl Drop for Serve {
     }
 }
 
-/// A bus where the consumer `c` reads `out` from the beginning, and `out` has published `names`.
 fn bus(db: &Path, names: &[&str]) -> Bus {
     let bus = Bus::open(db).unwrap();
     bus.declare(&Output::new("out")).unwrap();
@@ -64,7 +58,6 @@ fn bus(db: &Path, names: &[&str]) -> Bus {
     bus
 }
 
-/// Publishes a message named `name` in its data, its id the number in `name`.
 fn publish(bus: &Bus, name: &str) {
     let n: u128 = name.trim_start_matches('m').parse().unwrap();
     let time: Timestamp = "2026-10-31T09:30:00Z".parse().unwrap();
@@ -92,10 +85,8 @@ fn serve_sends_messages_only_when_asked() {
     let notify = json!({ "notify": {} });
 
     assert_eq!(serve.receive(), json!({ "ready": {} }));
-    // Messages wait already: one notify.
     assert_eq!(serve.receive(), notify);
     serve.send(r#"{"get_messages": {"limit": 2}}"#);
-    // The answer comes next: nothing came unasked before it.
     let first = serve.receive();
     assert_eq!(
         first["messages"][0],
@@ -114,11 +105,8 @@ fn serve_sends_messages_only_when_asked() {
         })
     );
     assert_eq!(names(&first), ["m1", "m2"]);
-    // m3 is past what the session delivered.
     assert_eq!(serve.receive(), notify);
 
-    // An ack of a message not delivered yet is refused, and moves nothing; so are a line that
-    // is not one of the session and a limit of 0, and the session goes on.
     serve.send(r#"{"ack": {"connection": 1, "seq": 3}}"#);
     assert!(serve.receive()["error"].is_string());
     serve.send(r#"{"get_messages": {"limit": 0}}"#);
@@ -133,8 +121,6 @@ fn serve_sends_messages_only_when_asked() {
     serve.send(r#"{"get_messages": {"limit": 10}}"#);
     assert_eq!(names(&serve.receive()), ["m3"]);
 
-    // A write wakes the session: one notify, however many messages follow before the
-    // consumer asks. An ack is no ask: no notify follows its answer, m5 and m6 or not.
     publish(&bus, "m4");
     assert_eq!(serve.receive(), notify);
     publish(&bus, "m5");
@@ -145,7 +131,6 @@ fn serve_sends_messages_only_when_asked() {
         json!({ "acked": { "connection": 1, "seq": 2 } })
     );
     serve.send(r#"{"get_messages": {"limit": 10}}"#);
-    // m3 was not acknowledged: it comes back.
     assert_eq!(names(&serve.receive()), ["m3", "m4", "m5", "m6"]);
 }
 
@@ -154,21 +139,17 @@ fn a_session_follows_its_consumers_connections_as_they_come_and_go() {
     let dir = tempfile::tempdir().unwrap();
     let db = &dir.path().join("bus.db");
     let bus = bus(db, &[]);
-    // A consumer with no connection yet: its session waits.
     let mut serve = Serve::start(db, &["serve", "later"]);
     assert_eq!(serve.receive(), json!({ "ready": {} }));
     serve.send(r#"{"get_messages": {"limit": 10}}"#);
     assert_eq!(serve.receive(), json!({ "messages": [] }));
 
-    // Connected during the session, it is notified.
     bus.connect("later", "out", Start::Beginning).unwrap();
     publish(&bus, "m1");
     assert_eq!(serve.receive(), json!({ "notify": {} }));
     serve.send(r#"{"get_messages": {"limit": 10}}"#);
     assert_eq!(names(&serve.receive()), ["m1"]);
 
-    // Its output deleted while it handled a message: the ack has nothing left to move, and
-    // there is nothing more to deliver.
     bus.delete("out").unwrap();
     serve.send(r#"{"ack": {"connection": 2, "seq": 1}}"#);
     assert_eq!(
@@ -179,7 +160,6 @@ fn a_session_follows_its_consumers_connections_as_they_come_and_go() {
     assert_eq!(serve.receive(), json!({ "messages": [] }));
 }
 
-/// A message line of the session: only `type` and `data` are required.
 fn ask(n: u128, timeout_ms: u64) -> String {
     let id = Uuid::from_u128(n);
     format!(
@@ -201,7 +181,6 @@ fn serve_publishes_and_asks_and_answers_requests() {
     assert!(published["published"]["id"].is_string(), "{published}");
     assert_eq!(serve.receive(), json!({ "notify": {} }));
 
-    // Nobody takes it before its deadline, which is now.
     serve.send(&ask(2, 0));
     let id = |n: u128| json!(Uuid::from_u128(n));
     assert_eq!(
@@ -218,7 +197,6 @@ fn serve_publishes_and_asks_and_answers_requests() {
         json!({ "taken": { "seq": 2, "state": "expired" } })
     );
 
-    // Three wait at once, and the session goes on meanwhile.
     for n in 3..=5 {
         serve.send(&ask(n, 3_600_000));
         assert_eq!(
@@ -238,7 +216,6 @@ fn serve_publishes_and_asks_and_answers_requests() {
         "{messages}"
     );
 
-    // Replies come in any order, each as it is given, each naming its request.
     serve.send(r#"{"take": {"seq": 4}}"#);
     assert_eq!(
         serve.receive(),
@@ -250,7 +227,6 @@ fn serve_publishes_and_asks_and_answers_requests() {
         serve.receive(),
         json!({ "reply": { "to": 4, "id": id(4), "data": { "answer": 4 } } })
     );
-    // Another program replies: the session learns it from the bus.
     bus.reply(herdr_bus::Seq(5), json!("five")).unwrap();
     assert_eq!(
         serve.receive(),
@@ -263,7 +239,6 @@ fn serve_publishes_and_asks_and_answers_requests() {
         json!({ "reply": { "to": 3, "id": id(3), "data": null } })
     );
 
-    // A line the session does not know is refused.
     serve.send(r#"{"cancel": {"seq": 3}}"#);
     assert!(serve.receive()["error"].is_string());
 }
@@ -279,29 +254,11 @@ fn serve_refuses_a_name_that_is_no_consumers() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
-    // No `ready`: the session never started.
     assert!(output.stdout.is_empty());
 }
 
-/// The variable that names, in a test run by [`run_alone`], the folder [`Fakes`] made.
 const FAKES: &str = "HERDR_BUS_TEST_FAKES";
 
-/// A folder of fake commands for the client, first on `PATH`, beside a bus file where the
-/// consumer `app` of this machine reads `out`, which holds no message yet:
-///
-/// - `herdr-bus`, the built one, but which, for the consumer `app` of any machine, publishes `late` on `out`
-///   once `serve` has answered an empty `messages`: a client that pulls then gets `late` only
-///   if it waited for it. It holds the first messages `serve` sends `app` until it has
-///   published `next` and `serve` has notified it, so that this notify reaches the client
-///   before the answer to its next call. For the consumer `dies`, it answers `ready`, then
-///   ends as a dead link does.
-/// - `hc`, whose `machine ls --json` lists `box`, reached by ssh at `me@box.example:2222`;
-///   `down`, at `down.example`; and `relay`, reached through a command it does not show.
-/// - `ssh`, which writes its arguments to `ssh-args`, one a line, prints a line as a login
-///   shell's profile can, and runs the line it would run on the machine here, without the
-///   login shell, whose real profile could print anything. For
-///   `down.example`, it fails as a refused connection does. It stands for the command of a
-///   `BusLocation::Command` too, which runs its last argument there.
 struct Fakes {
     dir: tempfile::TempDir,
 }
@@ -374,7 +331,6 @@ exec sh -c "$(printf '%s' "$last" | sed 's/^sh -lc/sh -c/')""#,
         fakes
     }
 
-    /// Reopens what [`Fakes::new`] made, in a test [`run_alone`] runs.
     fn here() -> PathBuf {
         PathBuf::from(std::env::var_os(FAKES).expect("run by run_alone"))
     }
@@ -430,10 +386,8 @@ fn the_client_waits_for_a_message_then_returns_it() {
 #[ignore = "the_client_waits_for_a_message_then_returns_it runs it, in a process of its own"]
 fn client_here() {
     let client = Client::connect(BusLocation::Local, "app").unwrap();
-    // `out` holds nothing until `serve` has answered the pull empty.
     let deliveries = client.pull(10).unwrap();
     assert_eq!(data_names(&deliveries), ["late"]);
-    // A notify for `next` waits before the ack's answer: the ack is answered all the same.
     client
         .ack(deliveries[0].connection, deliveries[0].seq)
         .unwrap();
@@ -444,13 +398,11 @@ fn client_here() {
     let bus = Bus::open(&Fakes::here().join("bus.db")).unwrap();
     assert!(bus.pull("app", 10).unwrap().is_empty());
 
-    // A session that does not start says why, in what the command wrote.
     let Err(Error::Session(why)) = Client::connect(BusLocation::Local, "app@box") else {
         panic!("a bad consumer started a session");
     };
     assert!(why.contains("bad consumer"), "{why}");
 
-    // A session that ends says why too, at each call from then on, a write to it or a read.
     let client = Client::connect(BusLocation::Local, "dies").unwrap();
     for _ in 0..2 {
         let Err(Error::Session(why)) = client.ack(deliveries[0].connection, deliveries[0].seq)
@@ -472,7 +424,6 @@ fn client_on_a_machine() {
     let fakes = Fakes::here();
     let id = Bus::open(&fakes.join("bus.db")).unwrap().id();
     let client = Client::connect(BusLocation::Machine("box".to_owned()), "app").unwrap();
-    // The bare name went as this machine's consumer, whose connection reads `out`.
     assert_eq!(data_names(&client.pull(10).unwrap()), ["late"]);
     let args = std::fs::read_to_string(fakes.join("ssh-args")).unwrap();
     assert_eq!(
@@ -521,10 +472,8 @@ fn the_client_reaches_another_machine_through_a_command() {
 fn client_through_a_command() {
     let fakes = Fakes::here();
     let id = Bus::open(&fakes.join("bus.db")).unwrap().id();
-    // The fake `ssh` runs its last argument as the command of `hc machine add --via` does.
     let via = |args: &[&str]| BusLocation::Command(args.iter().map(|&arg| arg.into()).collect());
     let client = Client::connect(via(&["ssh", "-a", "relay", "-C"]), "app").unwrap();
-    // The bare name went as this machine's consumer, whose connection reads `out`.
     assert_eq!(data_names(&client.pull(10).unwrap()), ["late"]);
     let args = std::fs::read_to_string(fakes.join("ssh-args")).unwrap();
     assert_eq!(
@@ -562,7 +511,6 @@ fn client_shared() {
     let bus = Bus::open(&Fakes::here().join("bus.db")).unwrap();
     bus.declare(&Output::new("asks")).unwrap();
     bus.connect("answerer", "asks", Start::Beginning).unwrap();
-    // The asker reads nothing: a consumer with no connection.
     let asker = Client::connect(BusLocation::Local, "asker").unwrap();
     let answerer = Client::connect(BusLocation::Local, "answerer").unwrap();
     let hour = std::time::Duration::from_secs(3600);
@@ -575,10 +523,7 @@ fn client_shared() {
                 scope.spawn(move || asker.request("asks", &question(n), hour).unwrap())
             })
             .collect();
-        // One thread answers the three, the last asked first, while the askers wait and
-        // another thread publishes.
         let answering = scope.spawn(|| {
-            // A pull returns again what was not acknowledged.
             let mut pulled = std::collections::BTreeMap::new();
             while pulled.len() < 3 {
                 for delivery in answerer.pull(10).unwrap() {
@@ -605,9 +550,6 @@ fn client_shared() {
         Outcome::Timeout { taken: false }
     );
 
-    // A close from another thread ends the calls of the session, those that wait and those that
-    // come after (the client's own tests hold the first). The requests go on `out`, which the
-    // answerer does not read: its pull waits too.
     std::thread::scope(|scope| {
         let waiting = scope.spawn(|| asker.request("out", &question(5), hour));
         let pulling = scope.spawn(|| answerer.pull(10));

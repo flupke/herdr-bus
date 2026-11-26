@@ -18,14 +18,12 @@ pub const TYPE: &str = "herdr.words";
 /// The author of words the person at the keyboard wrote.
 pub const USER: &str = "user";
 
-/// The `data` of a `herdr.words` message.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Words {
     /// Who wrote them: [`USER`] for the person at the keyboard.
     pub author: String,
     /// The actor they were written to, such as [`pane`] for an agent in a pane, or `None`.
     pub to: Option<String>,
-    /// The words, as written.
     pub text: String,
 }
 

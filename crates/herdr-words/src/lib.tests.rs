@@ -1,6 +1,5 @@
 use super::*;
 
-/// The format the other apps' tickets are written against: a rename here breaks them.
 #[test]
 fn words_have_the_shared_format() {
     let to_a_pane = Words {

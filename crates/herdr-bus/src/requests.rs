@@ -1,10 +1,3 @@
-//! Requests: messages with a deadline, which take one reply, kept with the request.
-//!
-//! Every judgment of a deadline is made by the clock of the bus's machine, inside the write it
-//! decides, never by a consumer's: a request past its deadline that nobody took can no longer
-//! be taken, so its asker's timeout, read under the same lock, says for good that nobody will
-//! handle it.
-
 use std::fmt;
 use std::time::Duration;
 
@@ -18,15 +11,12 @@ use crate::messages::{append, seq_of};
 use crate::outputs::require;
 use crate::{Bus, Error, Message, Result, Seq};
 
-/// A request as the bus holds it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     /// When its asker stops waiting, set once, when it was first asked: by then a consumer
     /// must have taken it, or none can.
     pub deadline: Timestamp,
-    /// When a consumer took it, if one did.
     pub taken: Option<Timestamp>,
-    /// Its one reply, once it has it.
     pub reply: Option<Reply>,
 }
 
@@ -38,17 +28,14 @@ pub struct Reply {
     pub replied: Timestamp,
 }
 
-/// Where a request stands, as a delivery of it says: [`Delivery::request`](crate::Delivery).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestState {
     pub deadline: Timestamp,
     /// Whether a consumer took it already: one that crashed after its take, say.
     pub taken: bool,
-    /// Whether it has its reply.
     pub replied: bool,
 }
 
-/// What [`Bus::take`] found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Take {
@@ -63,7 +50,6 @@ pub enum Take {
     Expired,
 }
 
-/// What became of a request, for its asker: [`Bus::outcome`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum Outcome {
     /// Neither replied nor past its deadline yet.
@@ -148,20 +134,15 @@ impl Bus {
         })
     }
 
-    /// What became of the request at `seq`, for its asker, who waits on it: its reply, a
-    /// timeout, or neither yet.
     pub fn outcome(&self, seq: Seq) -> Result<Outcome> {
         let outcome = self.read(|tx| judge(tx, seq))?;
         match outcome {
-            // Read again under the write lock: a take that read the clock before the deadline
-            // may still be committing, and `taken: false` must be final.
             Outcome::TimedOut { .. } => self.write(|tx| judge(tx, seq)),
             outcome => Ok(outcome),
         }
     }
 }
 
-/// The request at `seq` in `tx`, or none when it is no request.
 fn read(tx: &Transaction, seq: Seq) -> Result<Option<Request>> {
     Ok(tx
         .query_row(
@@ -173,7 +154,6 @@ fn read(tx: &Transaction, seq: Seq) -> Result<Option<Request>> {
         .flatten())
 }
 
-/// The outcome of the request at `seq`, by the clock now.
 fn judge(tx: &Transaction, seq: Seq) -> Result<Outcome> {
     let request = read(tx, seq)?.ok_or(Error::NotARequest(seq))?;
     Ok(match request.reply {
@@ -187,8 +167,6 @@ fn judge(tx: &Transaction, seq: Seq) -> Result<Outcome> {
     })
 }
 
-/// The request in the four columns from `first` on, `deadline`, `taken`, `reply` and
-/// `replied`: none when `deadline` is NULL, as for a plain message in a join.
 pub(crate) fn request_columns(row: &Row<'_>, first: usize) -> rusqlite::Result<Option<Request>> {
     let Some(deadline) = parsed_or_null(row, first)? else {
         return Ok(None);
@@ -208,7 +186,6 @@ pub(crate) fn request_columns(row: &Row<'_>, first: usize) -> rusqlite::Result<O
 }
 
 impl Request {
-    /// What a delivery says of it.
     pub(crate) fn state(&self) -> RequestState {
         RequestState {
             deadline: self.deadline,

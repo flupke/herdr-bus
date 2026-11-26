@@ -14,7 +14,6 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 /// write in the runs `.agents/research/watching-the-bus-file.md` records.
 pub(crate) const SETTLE: Duration = Duration::from_millis(30);
 
-/// How long a watcher waits without an event before it looks anyway.
 pub(crate) const BACKSTOP: Duration = Duration::from_secs(1);
 
 /// Watches the folder of the bus file at `path`, and calls `written` on each modification of
@@ -51,8 +50,6 @@ pub(crate) fn watch(
     Ok(watcher)
 }
 
-/// The instant of `deadline`, a time by this machine's clock: now when it has passed, and a
-/// day from now at the latest, which a waiter wakes at and looks again.
 pub(crate) fn instant_of(deadline: Timestamp) -> Instant {
     const DAY: Duration = Duration::from_secs(24 * 3600);
     let left = Timestamp::now().duration_until(deadline);

@@ -1,5 +1,3 @@
-//! Connections: which consumer reads which output, and how far it got.
-
 use jiff::Timestamp;
 use rusqlite::{OptionalExtension, Row, Transaction, params};
 use serde::Serialize;
@@ -11,16 +9,13 @@ use crate::{Bus, ConnectionId, Error, Result, Seq};
 /// The output of a tap: every output, present and future.
 pub const TAP: &str = "*";
 
-/// Where a new connection's consumer starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Start {
-    /// With the messages published from now on.
     Now,
     /// With every message its output holds, or the log for a tap.
     Beginning,
 }
 
-/// A connection: one consumer's cursor on one output, or on every output for a tap.
 #[derive(Clone, Debug, Serialize)]
 pub struct Connection {
     pub id: ConnectionId,
@@ -59,7 +54,6 @@ impl Bus {
             }
             let cursor: i64 = match start {
                 Start::Beginning => 0,
-                // Seqs grow across every output, so the log's last one is past each output's.
                 Start::Now => {
                     tx.query_row("SELECT coalesce(max(seq), 0) FROM messages", [], |row| {
                         row.get(0)
@@ -74,7 +68,7 @@ impl Bus {
         })
     }
 
-    /// Removes a connection. The messages it read stay in the log.
+    /// The messages it read stay in the log.
     pub fn disconnect(&self, connection: ConnectionId) -> Result<()> {
         self.write(|tx| {
             let removed = tx.execute("DELETE FROM connections WHERE id = ?1", [connection.0])?;
@@ -98,7 +92,6 @@ impl Bus {
         self.read(Self::all_connections)
     }
 
-    /// The connection `id`.
     pub fn connection(&self, id: ConnectionId) -> Result<Connection> {
         self.read(|tx| {
             tx.query_row(&format!("{SELECT} WHERE c.id = ?1"), [id.0], connection)
@@ -114,7 +107,6 @@ impl Bus {
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The connections on the output `name`, by id: taps are not.
     pub(crate) fn connections_on(tx: &Transaction, name: &str) -> Result<Vec<Connection>> {
         Ok(tx
             .prepare(&format!("{SELECT} WHERE c.output = ?1 ORDER BY c.id"))?
@@ -123,7 +115,6 @@ impl Bus {
     }
 }
 
-/// The output `connection` reads: an output's name, or [`TAP`].
 pub(crate) fn output_of(tx: &Transaction, connection: ConnectionId) -> Result<String> {
     tx.query_row(
         "SELECT output FROM connections WHERE id = ?1",
@@ -157,7 +148,6 @@ fn connection(row: &Row<'_>) -> rusqlite::Result<Connection> {
         output: row.get(2)?,
         enabled: row.get(3)?,
         cursor: Seq(row.get(4)?),
-        // A count is never negative.
         lag: u64::try_from(row.get::<_, i64>(6)?).unwrap_or_default(),
         created: parsed(row, 5)?,
     })

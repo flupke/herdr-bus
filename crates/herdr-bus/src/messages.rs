@@ -1,5 +1,3 @@
-//! The log: publishing messages and reading them back.
-
 use jiff::Timestamp;
 use rusqlite::types::Value;
 use rusqlite::{OptionalExtension, Row, Transaction, params, params_from_iter};
@@ -35,31 +33,25 @@ pub struct Message {
     pub links: Vec<Link>,
 }
 
-/// A link a message carries, for people.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Link {
     pub label: String,
     pub url: String,
 }
 
-/// A message as the log holds it.
 #[derive(Clone, Debug, Serialize)]
 pub struct Stored {
     pub seq: Seq,
-    /// The output it was published on.
     pub output: String,
     /// When it was appended.
     pub published: Timestamp,
     pub message: Message,
-    /// Where it stands as a request, when it is one: a plain message has none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request: Option<Request>,
 }
 
-/// Which messages [`Bus::messages`] lists, newest first.
 #[derive(Clone, Debug)]
 pub struct MessageQuery {
-    /// Only those published on this output.
     pub output: Option<String>,
     /// Only those this connection reads.
     pub connection: Option<ConnectionId>,
@@ -97,7 +89,6 @@ impl Message {
         self
     }
 
-    /// When the event happened, if not now.
     #[must_use]
     pub fn time(mut self, time: Timestamp) -> Self {
         self.time = time;
@@ -138,7 +129,6 @@ impl Bus {
         })
     }
 
-    /// The message at `seq`.
     pub fn message(&self, seq: Seq) -> Result<Stored> {
         self.read(|tx| {
             tx.query_row(&format!("{SELECT} WHERE m.seq = ?1"), [seq.0], stored)
@@ -179,7 +169,6 @@ impl Bus {
     }
 }
 
-/// The seq of the message `id` on `output`, if the output holds it.
 pub(crate) fn seq_of(tx: &Transaction, output: &str, id: Uuid) -> Result<Option<Seq>> {
     Ok(tx
         .query_row(
@@ -210,7 +199,6 @@ pub(crate) fn append(tx: &Transaction, output: &str, message: &Message) -> Resul
     Ok(Seq(tx.last_insert_rowid()))
 }
 
-/// The messages, `m`, each with its request, `r`, when it is one.
 pub(crate) const SELECT: &str = "
     SELECT m.seq, m.output, m.published, m.id, m.type, m.subject, m.time, m.data, m.links,
       r.deadline, r.taken, r.reply, r.replied
@@ -239,7 +227,6 @@ fn query_all(tx: &Transaction, sql: &str, values: Vec<Value>) -> rusqlite::Resul
         .collect()
 }
 
-/// A limit as SQL takes it.
 pub(crate) fn limit(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
 }

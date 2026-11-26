@@ -1,6 +1,3 @@
-//! The `herdr-bus` command's JSON, which herdr-bowtie and other programs read: each format is a
-//! hand-written literal, so a change breaks this test as it would break them.
-
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -23,7 +20,6 @@ fn herdr_bus(db: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     child.wait_with_output().unwrap()
 }
 
-/// Runs a command that succeeds, and returns its JSON.
 fn json(db: &Path, args: &[&str], stdin: Option<&str>) -> Value {
     let output = herdr_bus(db, &[args, &["--json"]].concat(), stdin);
     assert!(
@@ -34,7 +30,6 @@ fn json(db: &Path, args: &[&str], stdin: Option<&str>) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-/// `value` with its timestamps, which change with each run, replaced by `"<time>"`.
 fn timeless(mut value: Value) -> Value {
     match &mut value {
         Value::Object(fields) => {
@@ -48,7 +43,6 @@ fn timeless(mut value: Value) -> Value {
                     "taken",
                     "replied",
                 ];
-                // A request's `taken` is a time, or null; a delivery's, a flag.
                 if times.contains(&key.as_str()) && field.is_string() {
                     *field = json!("<time>");
                 } else {
@@ -90,7 +84,6 @@ fn the_wiring_prints_the_documented_json() {
             "connections": [],
         })
     );
-    // A bare name is the consumer of this machine, whose id `id` prints.
     let connection = json!({
         "id": 1,
         "consumer": format!("inbox@{id}"),
@@ -104,7 +97,6 @@ fn the_wiring_prints_the_documented_json() {
         timeless(json(db, &["connect", "inbox", "events"], None)),
         connection
     );
-    // A tap shows in `connections`, not under the outputs.
     json(db, &["connect", "hook", "*"], None);
     assert_eq!(
         timeless(json(db, &["outputs"], None))[0]["connections"],
@@ -146,7 +138,6 @@ fn a_consumer_reads_the_documented_json() {
         json(db, &publish, data),
         json!({ "seq": 1, "id": message_id })
     );
-    // The same id again: exit 0, the same seq.
     assert_eq!(
         json(db, &publish, data),
         json!({ "seq": 1, "id": message_id })
@@ -160,7 +151,6 @@ fn a_consumer_reads_the_documented_json() {
         "data": { "any": ["json"] },
         "links": [{ "label": "Source", "url": "https://example.com/?a=b" }],
     });
-    // The consumer's full name reads the same as its bare one.
     assert_eq!(
         json(db, &["pull", &format!("inbox@{id}")], None),
         json!([{ "connection": 1, "seq": 1, "output": "events", "message": message }])
@@ -170,7 +160,6 @@ fn a_consumer_reads_the_documented_json() {
         json!([{ "seq": 1, "output": "events", "published": "<time>", "message": message }])
     );
 
-    // Without an id, the bus generates a UUIDv7: a new message each time.
     let generated = ["publish", "events", "--type", "t", "--data", "2"];
     let first = json(db, &generated, None);
     let second = json(db, &generated, None);
@@ -181,7 +170,6 @@ fn a_consumer_reads_the_documented_json() {
     let version = |published: &Value| published["id"].as_str().unwrap().as_bytes()[14];
     assert_eq!((version(&first), version(&second)), (b'7', b'7'));
 
-    // A connection's messages are those of its output alone, newest first.
     json(db, &["declare", "news"], None);
     json(db, &["publish", "news", "--type", "t", "--data", "4"], None);
     let seqs = |args: &[&str]| -> Vec<Value> {
@@ -302,7 +290,6 @@ fn a_request_nobody_takes_exits_2_and_can_no_longer_be_taken() {
         printed,
         json!({ "seq": 1, "id": id, "timeout": { "taken": false } })
     );
-    // For people, on stderr: the request's fate.
     let output = herdr_bus(db, &ask, None);
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
@@ -326,7 +313,6 @@ fn a_request_prints_its_reply_and_its_consumer_reads_the_documented_json() {
     let db = &dir.path().join("bus.db");
     json(db, &["declare", "asks"], None);
     json(db, &["connect", "answerer", "asks"], None);
-    // A session of the answerer, to learn when the request is on the bus.
     let mut serve = Command::new(env!("CARGO_BIN_EXE_herdr-bus"))
         .arg("--db")
         .arg(db)
@@ -380,14 +366,12 @@ fn a_request_prints_its_reply_and_its_consumer_reads_the_documented_json() {
     );
     let output = asker.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(0));
-    // In its documented order, which a reader of the bytes may rely on.
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         format!("{{\"seq\":1,\"id\":\"{id}\",\"reply\":{{\"answer\":42}}}}\n")
     );
     let printed = json!({ "seq": 1, "id": id, "reply": { "answer": 42 } });
 
-    // A second reply leaves the first; asked again, the request prints it at once.
     json(db, &["reply", "1", "--data", "0"], None);
     assert_eq!(json(db, &ask, None), printed);
     assert_eq!(

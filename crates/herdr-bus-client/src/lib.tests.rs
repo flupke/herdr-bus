@@ -2,8 +2,6 @@ use std::process::Command;
 
 use super::*;
 
-/// The line `ssh` runs on another machine reaches `herdr-bus` with the consumer as one
-/// argument, whatever it holds: `sh` itself reads it back.
 #[test]
 fn the_remote_line_passes_the_consumer_through_two_shells() {
     for consumer in ["app", "it's", "a b", "$HOME", "'", "-x"] {
@@ -19,9 +17,6 @@ fn the_remote_line_passes_the_consumer_through_two_shells() {
     }
 }
 
-/// A link that went silent, that reads nothing and says nothing after `ready`, does not hold a
-/// request past its deadline and the grace, a request too large for the pipe included, nor
-/// the calls after it.
 #[test]
 fn a_request_on_a_silent_link_returns_by_its_deadline() {
     let mut silent = Command::new("sh");
@@ -35,8 +30,6 @@ fn a_request_on_a_silent_link_returns_by_its_deadline() {
     }
 }
 
-/// A link silent from the start, whose command started a child that holds the pipes, fails by
-/// the deadline, with what the command wrote on stderr, and leaves no process behind.
 #[test]
 fn a_session_silent_before_ready_fails_by_its_deadline_and_leaves_nothing() {
     let folder = tempfile::tempdir().unwrap();

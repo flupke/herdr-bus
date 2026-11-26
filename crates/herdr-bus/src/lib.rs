@@ -68,7 +68,6 @@ pub struct Seq(pub i64);
 #[serde(transparent)]
 pub struct ConnectionId(pub i64);
 
-/// An open bus file.
 pub struct Bus {
     sql: rusqlite::Connection,
     id: Uuid,
@@ -87,7 +86,6 @@ impl Bus {
         self.id
     }
 
-    /// Opens the machine's bus file, at [`Bus::default_path`].
     pub fn open_default() -> Result<Self> {
         Self::open(&Self::default_path()?)
     }
@@ -107,12 +105,10 @@ impl Bus {
         Ok(data.join("herdr-bus/bus.db"))
     }
 
-    /// Runs `change` in one short `BEGIN IMMEDIATE` transaction: an error rolls it back.
     fn write<T>(&self, change: impl FnOnce(&Transaction) -> Result<T>) -> Result<T> {
         self.transaction(TransactionBehavior::Immediate, change)
     }
 
-    /// Runs `read` on one snapshot of the file.
     fn read<T>(&self, read: impl FnOnce(&Transaction) -> Result<T>) -> Result<T> {
         self.transaction(TransactionBehavior::Deferred, read)
     }

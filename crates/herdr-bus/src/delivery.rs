@@ -1,6 +1,3 @@
-//! What a consumer does: pull the messages of its connections, and acknowledge those it
-//! handled.
-
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -78,7 +75,6 @@ impl Bus {
     pub fn ack(&self, connection: ConnectionId, seq: Seq) -> Result<()> {
         self.write(|tx| {
             let reads = output_of(tx, connection)?;
-            // A seq the connection never delivered would skip messages it has yet to.
             let output: Option<String> = tx
                 .query_row(
                     "SELECT output FROM messages WHERE seq = ?1",
@@ -99,14 +95,12 @@ impl Bus {
     }
 
     /// Where each enabled connection of `consumer`, a bare or full name, stands, by id: its
-    /// cursor, and the newest message of its output. `herdr-bus serve` asks it to learn when
-    /// to notify.
+    /// cursor, and the newest message of its output.
     pub fn positions(&self, consumer: &str) -> Result<Vec<Position>> {
         let consumer = self.consumer(consumer)?;
         self.read(|tx| {
             Ok(tx
                 .prepare(
-                    // Each subquery reads the end of an index: the log's, or its output's.
                     "SELECT c.id, c.cursor,
                        CASE WHEN c.output = '*' THEN (SELECT max(seq) FROM messages)
                        ELSE (SELECT max(seq) FROM messages WHERE output = c.output) END
@@ -124,12 +118,10 @@ impl Bus {
     }
 }
 
-/// Where a connection stands: what [`Bus::positions`] returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Position {
     pub connection: ConnectionId,
     /// The last message its consumer acknowledged.
     pub cursor: Seq,
-    /// The newest message of its output, if it has any.
     pub newest: Option<Seq>,
 }

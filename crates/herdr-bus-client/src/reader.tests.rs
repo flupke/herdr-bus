@@ -2,8 +2,6 @@ use herdr_bus::{Seq, Uuid};
 
 use super::*;
 
-/// The end of a session answers every caller that waits, whatever it waits for: an answer, a
-/// request's reply, a notify. A caller waiting for nothing would hang.
 #[test]
 fn the_end_answers_every_caller_that_waits() {
     let waiters = Waiters::default();

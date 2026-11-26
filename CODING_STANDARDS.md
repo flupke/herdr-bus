@@ -66,6 +66,18 @@ Hold each test the change adds or keeps to these rules.
 - A test waits on an event, never on the clock: a thread's end, a flag the other side sets, and
   ordering to prove that nothing happened. nextest ends a test still running after two minutes.
 
+## Comments
+
+- A comment stays only when it says what the code cannot. The kinds that stay:
+  - the `///` of the clap types of `crates/herdr-bus-cli/src/lib.rs`, which `--help` prints;
+  - the `//!` front page of each crate's `lib.rs`, with its examples, which run as doc tests;
+  - a doc comment on the public API of a library crate that says what its signature cannot: a
+    guarantee, an effect, an error, a wait;
+  - behaviour that an outside system forces: SQLite, ssh, the operating system, clap.
+- A surprise in our own code is fixed in the code, by a name, a type, an extraction or a test.
+- rustfmt lays out the struct variants of an enum on one line only when every variant has a doc
+  comment, or none: delete or keep them together.
+
 ## Docs
 
 - `README.md` is for people deciding whether to use herdr-bus: what it is, how to install the

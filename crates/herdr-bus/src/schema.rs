@@ -1,5 +1,3 @@
-//! The schema and its migrations, applied when a [`Bus`](crate::Bus) opens the file.
-
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -10,10 +8,7 @@ use uuid::Uuid;
 use crate::codec::parsed;
 use crate::{Error, Result};
 
-/// Each migration in order: the file's `user_version` is the number applied.
 const MIGRATIONS: &[&str] = &[
-    // 1: the bus's id, the outputs, the log, and the connections. The id's row goes in with
-    // it, in the same transaction (`migrate`).
     "
     -- One row: the bus's id, a random UUID made with the file. A consumer's name ends with
     -- the id of its machine's bus.
@@ -60,7 +55,6 @@ const MIGRATIONS: &[&str] = &[
       UNIQUE (consumer, output)
     );
     ",
-    // 2: requests, each with its one reply, kept beside the log.
     "
     -- A request is a message of the log with a deadline, which takes one reply. Times are
     -- RFC 3339, by the clock of this bus's machine.
@@ -76,17 +70,12 @@ const MIGRATIONS: &[&str] = &[
     ",
 ];
 
-/// How long a program waits for another's write lock.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The schema version this crate writes, and the newest it opens.
 fn known() -> i64 {
     i64::try_from(MIGRATIONS.len()).expect("a handful of migrations")
 }
 
-/// Opens the file at `path`, creating it and its folder when missing, and migrates it, and
-/// returns it with the bus's id. A file of a newer schema is refused before anything is
-/// written to it.
 pub(crate) fn open(path: &Path) -> Result<(Connection, Uuid)> {
     if let Some(parent) = path
         .parent()
@@ -106,7 +95,6 @@ pub(crate) fn open(path: &Path) -> Result<(Connection, Uuid)> {
     let applied = refuse_newer(&connection, path)?;
     use_wal(&connection)?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
-    // A current file takes no write lock, so that reads never queue behind a writer to open it.
     if applied < known() {
         migrate(&mut connection, path)?;
     }
@@ -114,7 +102,6 @@ pub(crate) fn open(path: &Path) -> Result<(Connection, Uuid)> {
     Ok((connection, id))
 }
 
-/// Messages may carry what people wrote: a folder the bus creates is its user's alone.
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -177,7 +164,6 @@ fn refuse_newer(connection: &Connection, path: &Path) -> Result<i64> {
 }
 
 fn migrate(connection: &mut Connection, path: &Path) -> Result<()> {
-    // Read again under the write lock: another program may have migrated it meanwhile.
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let applied = refuse_newer(&tx, path)?;
     if applied == known() {
